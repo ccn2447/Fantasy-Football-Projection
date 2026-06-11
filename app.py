@@ -358,8 +358,16 @@ with tab_teams:
             st.markdown(f"**Strength of schedule, {UPCOMING_SEASON}** — average opponent generosity "
                         "to each position (percentile; 100 = easiest schedule).")
             sos_wide = sos.pivot(index="team", columns="position", values="sos_pctl")[POSITIONS]
-            st.dataframe(sos_wide.style.background_gradient(cmap="RdYlGn", axis=None),
-                         width="stretch", height=450)
+            sos_wide = sos_wide.sort_index(ascending=False)  # A at top after y-axis render
+            fig_sos = px.imshow(
+                sos_wide,
+                color_continuous_scale="RdYlGn",
+                aspect="auto",
+                labels={"x": "Position", "y": "", "color": "SOS pctl"},
+                text_auto=".0f",
+            )
+            fig_sos.update_layout(height=700, coloraxis_colorbar_title="Easier →")
+            st.plotly_chart(fig_sos, width="stretch")
         st.caption("A reminder these are last-season tendencies — new coordinators and QB changes "
                    "can shift a team's identity. Treat as context, not gospel.")
 
