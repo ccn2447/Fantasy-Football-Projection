@@ -1,13 +1,16 @@
 """
-Fantasy Football Projection Tool — live nflverse data
+Fantasy Football Projection Tool — live data, superflex-aware, strategy-generating
 Run with:  streamlit run app.py
 
-Data source: nflverse (https://github.com/nflverse/nflverse-data), a free,
-public NFL data repository. Downloaded via the nflreadpy package — no API key.
+Data sources (all free, no API keys):
+- nflverse: real NFL stats, schedules, injury reports
+- Sleeper API: current injury status
+- FantasyFootballCalculator: market ADP
 """
 
 import datetime
 import io
+import urllib.parse
 
 import numpy as np
 import pandas as pd
@@ -15,196 +18,71 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-# ----------------------------------------------------------------------------
-# Page setup
-# ----------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Fantasy Football Projections",
-    page_icon="🏈",
-    layout="wide",
-)
+import data_sources as ds
+import projections as pj
+from data_sources import POSITIONS
 
-POSITIONS = ["QB", "RB", "WR", "TE"]
+st.set_page_config(page_title="Fantasy Football Projections", page_icon="🏈", layout="wide")
+
 POSITION_COLORS = {"QB": "#E4572E", "RB": "#17BEBB", "WR": "#FFC914", "TE": "#76B041"}
+DISPLAY_STATS = ["pass_yds", "pass_td", "interceptions", "rush_yds", "rush_td",
+                 "receptions", "rec_yds", "rec_td", "fumbles"]
 
-STAT_COLUMNS = [
-    "pass_yds", "pass_td", "interceptions",
-    "rush_yds", "rush_td",
-    "receptions", "rec_yds", "rec_td",
-    "fumbles",
-]
-
-CURRENT_YEAR = datetime.date.today().year
-# Last fully completed NFL season (season N runs into January of N+1)
-LAST_COMPLETE_SEASON = CURRENT_YEAR - 1 if datetime.date.today().month >= 3 else CURRENT_YEAR - 2
-
-
-def pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    """Return the first column name that exists (nflverse schemas vary by vintage)."""
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
-
+TODAY = datetime.date.today()
+LAST_COMPLETE_SEASON = TODAY.year - 1 if TODAY.month >= 3 else TODAY.year - 2
+UPCOMING_SEASON = LAST_COMPLETE_SEASON + 1
 
 # ----------------------------------------------------------------------------
-# nflverse data loading + aggregation
-# ----------------------------------------------------------------------------
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def load_nflverse_seasons(seasons: tuple[int, ...]) -> pd.DataFrame:
-    """Download weekly player stats from nflverse and aggregate to player-seasons."""
-    import nflreadpy as nfl
-
-    weekly = nfl.load_player_stats(list(seasons)).to_pandas()
-
-    # Regular season only
-    if "season_type" in weekly.columns:
-        weekly = weekly[weekly["season_type"] == "REG"]
-
-    name_col = pick_col(weekly, ["player_display_name", "player_name"])
-    team_col = pick_col(weekly, ["team", "recent_team"])
-    int_col = pick_col(weekly, ["passing_interceptions", "interceptions"])
-    pos_col = pick_col(weekly, ["position"])
-
-    rename = {
-        name_col: "player",
-        "passing_yards": "pass_yds",
-        "passing_tds": "pass_td",
-        int_col: "interceptions",
-        "rushing_yards": "rush_yds",
-        "rushing_tds": "rush_td",
-        "receiving_yards": "rec_yds",
-        "receiving_tds": "rec_td",
-    }
-    weekly = weekly.rename(columns={k: v for k, v in rename.items() if k})
-    weekly["team"] = weekly[team_col] if team_col else "—"
-
-    # Fumbles lost across all phases
-    fumble_parts = [c for c in
-                    ["sack_fumbles_lost", "rushing_fumbles_lost", "receiving_fumbles_lost"]
-                    if c in weekly.columns]
-    weekly["fumbles"] = weekly[fumble_parts].sum(axis=1) if fumble_parts else 0.0
-
-    for col in STAT_COLUMNS:
-        if col not in weekly.columns:
-            weekly[col] = 0.0
-        weekly[col] = pd.to_numeric(weekly[col], errors="coerce").fillna(0.0)
-
-    # Position: from stats if present, otherwise merge from rosters
-    if pos_col:
-        weekly["position"] = weekly[pos_col]
-    else:
-        rosters = nfl.load_rosters(list(seasons)).to_pandas()
-        r_id = pick_col(rosters, ["gsis_id", "player_id"])
-        rosters = rosters[[r_id, "position"]].drop_duplicates(r_id)
-        weekly = weekly.merge(
-            rosters.rename(columns={r_id: "player_id"}), on="player_id", how="left"
-        )
-
-    weekly["position"] = weekly["position"].astype(str).str.upper().str.strip()
-    weekly = weekly[weekly["position"].isin(POSITIONS)]
-
-    agg = (
-        weekly.groupby(["player_id", "player", "position", "season"])
-        .agg(
-            games=("week", "nunique"),
-            team=("team", "last"),
-            **{c: (c, "sum") for c in STAT_COLUMNS},
-        )
-        .reset_index()
-    )
-    return agg
-
-
-def build_projections(
-    season_stats: pd.DataFrame,
-    seasons: list[int],
-    projected_games: int,
-    min_games: int,
-) -> pd.DataFrame:
-    """Recency-weighted per-game rates × projected games."""
-    latest = max(seasons)
-    # Exponential recency weights: latest season counts most
-    weights = {s: 0.5 ** (latest - s) for s in seasons}
-
-    d = season_stats[season_stats["games"] > 0].copy()
-    d["weight"] = d["season"].map(weights) * d["games"]  # weight by games played too
-
-    for col in STAT_COLUMNS:
-        d[f"{col}_pg"] = d[col] / d["games"]
-
-    def agg_player(g: pd.DataFrame) -> pd.Series:
-        w = g["weight"].to_numpy()
-        out = {
-            "team": g.sort_values("season")["team"].iloc[-1],
-            "position": g["position"].iloc[-1],
-            "seasons_used": len(g),
-            "last_season_games": int(g.loc[g["season"] == g["season"].max(), "games"].iloc[0]),
-            "total_games": int(g["games"].sum()),
-        }
-        for col in STAT_COLUMNS:
-            out[f"{col}_pg"] = float(np.average(g[f"{col}_pg"], weights=w))
-        return pd.Series(out)
-
-    proj = d.groupby(["player_id", "player"]).apply(agg_player, include_groups=False).reset_index()
-
-    # Keep players active in the most recent season with enough sample
-    active_ids = set(season_stats.loc[season_stats["season"] == latest, "player_id"])
-    proj = proj[proj["player_id"].isin(active_ids) & (proj["total_games"] >= min_games)]
-
-    proj["games"] = projected_games
-    for col in STAT_COLUMNS:
-        proj[col] = (proj[f"{col}_pg"] * projected_games).round(1)
-    return proj
-
-
-# ----------------------------------------------------------------------------
-# Sidebar — data, league + scoring settings
+# Sidebar
 # ----------------------------------------------------------------------------
 st.sidebar.title("🏈 Settings")
 
 st.sidebar.subheader("Data source")
-source = st.sidebar.radio(
-    "Source",
-    ["nflverse (live)", "Sample data (offline)"],
-    help="nflverse downloads real NFL stats (free, no API key). "
-         "Sample data works offline with made-up demo numbers.",
-)
+source = st.sidebar.radio("Source", ["nflverse (live)", "Sample data (offline)"])
 
 if source == "nflverse (live)":
     season_range = st.sidebar.slider(
         "Seasons to base projections on",
         LAST_COMPLETE_SEASON - 5, LAST_COMPLETE_SEASON,
         (LAST_COMPLETE_SEASON - 2, LAST_COMPLETE_SEASON),
-        help="Recent seasons are weighted more heavily.",
     )
-    projected_games = st.sidebar.slider(
-        "Projected games next season", 10, 17, 16,
-        help="17 assumes no missed games; 15–16 bakes in typical injury risk.",
+    projected_games = st.sidebar.slider("Projected games next season", 10, 17, 16)
+    min_games = st.sidebar.slider("Minimum games played (sample size)", 1, 20, 6)
+    td_reg = st.sidebar.slider(
+        "TD regression", 0.0, 0.6, 0.3, 0.05,
+        help="TD rates are the noisiest stat year-to-year. This pulls each player's TD rate "
+             "toward the position average — 0.3 means 30% of the way. Improves accuracy; "
+             "set to 0 for raw historical rates.",
     )
-    min_games = st.sidebar.slider(
-        "Minimum games played (sample size)", 1, 20, 6,
-        help="Filters out players with too few games to project reliably.",
+    enrich = st.sidebar.multiselect(
+        "Extra data (each adds a download)",
+        ["Injury status & history", "Strength of schedule", "Market ADP"],
+        default=["Injury status & history", "Strength of schedule", "Market ADP"],
     )
+else:
+    enrich = []
 
 teams = st.sidebar.number_input("Teams in league", 4, 20, 12)
 
 st.sidebar.subheader("Starting roster")
-col1, col2 = st.sidebar.columns(2)
-qb_slots = col1.number_input("QB", 0, 3, 1)
-rb_slots = col2.number_input("RB", 0, 5, 2)
-wr_slots = col1.number_input("WR", 0, 5, 2)
-te_slots = col2.number_input("TE", 0, 3, 1)
-flex_slots = st.sidebar.number_input("FLEX (RB/WR/TE)", 0, 4, 1)
+c1, c2 = st.sidebar.columns(2)
+qb_slots = c1.number_input("QB", 0, 3, 1)
+rb_slots = c2.number_input("RB", 0, 5, 2)
+wr_slots = c1.number_input("WR", 0, 5, 2)
+te_slots = c2.number_input("TE", 0, 3, 1)
+flex_slots = c1.number_input("FLEX (RB/WR/TE)", 0, 4, 1)
+superflex_slots = c2.number_input(
+    "SUPERFLEX (QB/RB/WR/TE)", 0, 2, 0,
+    help="Superflex slots are almost always filled with QBs — this dramatically raises QB value.",
+)
 
 st.sidebar.subheader("Scoring")
-scoring_preset = st.sidebar.radio(
-    "Preset", ["PPR", "Half PPR", "Standard", "Custom"], horizontal=True
-)
+scoring_preset = st.sidebar.radio("Preset", ["PPR", "Half PPR", "Standard", "Custom"], horizontal=True)
 preset_ppr = {"PPR": 1.0, "Half PPR": 0.5, "Standard": 0.0}.get(scoring_preset, 1.0)
 
 with st.sidebar.expander("Scoring details", expanded=(scoring_preset == "Custom")):
     pts_per_rec = st.number_input("Points per reception", 0.0, 2.0, preset_ppr, 0.25)
+    te_bonus = st.number_input("TE reception bonus (TE premium)", 0.0, 1.0, 0.0, 0.25)
     pass_yds_per_pt = st.number_input("Passing yards per point", 10, 50, 25, 5)
     pass_td_pts = st.number_input("Passing TD", 1.0, 8.0, 4.0, 0.5)
     int_pts = st.number_input("Interception", -5.0, 0.0, -2.0, 0.5)
@@ -214,32 +92,94 @@ with st.sidebar.expander("Scoring details", expanded=(scoring_preset == "Custom"
     rec_td_pts = st.number_input("Receiving TD", 1.0, 8.0, 6.0, 0.5)
     fumble_pts = st.number_input("Fumble lost", -5.0, 0.0, -2.0, 0.5)
 
+
+def score(d: pd.DataFrame) -> pd.Series:
+    rec_pts = d["receptions"] * pts_per_rec
+    if te_bonus > 0 and "position" in d.columns:
+        rec_pts = rec_pts + np.where(d["position"] == "TE", d["receptions"] * te_bonus, 0)
+    return (
+        d["pass_yds"] / pass_yds_per_pt + d["pass_td"] * pass_td_pts
+        + d["interceptions"] * int_pts
+        + d["rush_yds"] / rush_yds_per_pt + d["rush_td"] * rush_td_pts
+        + rec_pts + d["rec_yds"] / rec_yds_per_pt + d["rec_td"] * rec_td_pts
+        + d["fumbles"] * fumble_pts
+    )
+
+
 # ----------------------------------------------------------------------------
-# Load data
+# Load + enrich data
 # ----------------------------------------------------------------------------
 st.title("Fantasy Football Projection Tool")
 
+tendencies = sos = None
 if source == "nflverse (live)":
     seasons = list(range(season_range[0], season_range[1] + 1))
     try:
         with st.spinner(f"Downloading {seasons[0]}–{seasons[-1]} stats from nflverse…"):
-            season_stats = load_nflverse_seasons(tuple(seasons))
-        df = build_projections(season_stats, seasons, projected_games, min_games)
-        st.success(
-            f"Projections for {len(df)} players, built from real "
-            f"{seasons[0]}–{seasons[-1]} stats ({len(season_stats)} player-seasons). "
-            "Recent seasons weighted more heavily."
-        )
+            weekly = ds.load_nflverse_weekly(tuple(seasons))
+        season_stats = ds.aggregate_seasons(weekly)
+        df = pj.build_projections(season_stats, seasons, projected_games, min_games, td_reg)
     except Exception as e:
-        st.error(
-            f"Could not download nflverse data ({e}). "
-            "Check your internet connection, or switch to sample data in the sidebar."
-        )
+        st.error(f"Could not download nflverse data ({e}). Check your connection or switch to sample data.")
         st.stop()
+
+    sources_ok, sources_down = [f"nflverse {seasons[0]}–{seasons[-1]}"], []
+
+    # Team tendencies (pass/run) — free, computed from already-downloaded data
+    tendencies = ds.team_tendencies(weekly, max(seasons))
+    df = df.merge(tendencies[["team", "pass_rate"]], on="team", how="left")
+
+    # Injuries
+    if "Injury status & history" in enrich:
+        with st.spinner("Fetching injury data…"):
+            sleeper = ds.load_sleeper_injuries()
+            inj_hist = ds.load_injury_history(max(seasons))
+        if sleeper is not None:
+            df["name_key_"] = ds.name_key(df["player"])
+            df = df.merge(sleeper, on=["name_key_", "position"], how="left")
+            sources_ok.append("Sleeper injuries")
+        else:
+            sources_down.append("Sleeper injury status")
+        if inj_hist is not None:
+            df = df.merge(inj_hist, on="player_id", how="left")
+            sources_ok.append(f"{max(seasons)} injury reports")
+        else:
+            sources_down.append("nflverse injury history")
+
+    # Strength of schedule
+    if "Strength of schedule" in enrich:
+        with st.spinner("Computing strength of schedule…"):
+            ratings = ds.defense_ratings(weekly, max(seasons), score)
+            schedule = ds.load_schedule_opponents(UPCOMING_SEASON)
+        if ratings is not None and schedule is not None:
+            sos = ds.compute_sos(schedule, ratings)
+            df = df.merge(sos, on=["team", "position"], how="left")
+            sources_ok.append(f"{UPCOMING_SEASON} schedule SOS")
+        else:
+            sources_down.append(f"{UPCOMING_SEASON} schedule (may not be released yet)")
+
+    # Market ADP
+    if "Market ADP" in enrich:
+        with st.spinner("Fetching market ADP…"):
+            adp_format = "Superflex" if superflex_slots > 0 else scoring_preset
+            adp = ds.load_adp(adp_format, int(teams), UPCOMING_SEASON)
+        if adp is not None:
+            if "name_key_" not in df.columns:
+                df["name_key_"] = ds.name_key(df["player"])
+            df = df.merge(adp, on=["name_key_", "position"], how="left")
+            sources_ok.append(f"FFC ADP ({adp_format})")
+        else:
+            sources_down.append("FantasyFootballCalculator ADP")
+
+    msg = f"Loaded: {', '.join(sources_ok)}."
+    if sources_down:
+        st.warning(msg + f" Unavailable right now: {', '.join(sources_down)} — those columns are hidden.")
+    else:
+        st.success(msg)
 else:
     df = pd.read_csv("sample_projections.csv")
     df["player_id"] = df["player"]
-    st.info("Using bundled **sample data** (demo numbers only).")
+    st.info("Using bundled **sample data** (demo numbers only — live extras like injuries/SOS/ADP need the nflverse source).")
 
 df["position"] = df["position"].astype(str).str.upper().str.strip()
 df = df[df["position"].isin(POSITIONS)].copy()
@@ -247,60 +187,42 @@ df = df[df["position"].isin(POSITIONS)].copy()
 # ----------------------------------------------------------------------------
 # Scoring, VOR, tiers
 # ----------------------------------------------------------------------------
-df["proj_pts"] = (
-    df["pass_yds"] / pass_yds_per_pt
-    + df["pass_td"] * pass_td_pts
-    + df["interceptions"] * int_pts
-    + df["rush_yds"] / rush_yds_per_pt
-    + df["rush_td"] * rush_td_pts
-    + df["receptions"] * pts_per_rec
-    + df["rec_yds"] / rec_yds_per_pt
-    + df["rec_td"] * rec_td_pts
-    + df["fumbles"] * fumble_pts
-).round(1)
+df["proj_pts"] = score(df).round(1)
 df["ppg"] = (df["proj_pts"] / df["games"].replace(0, np.nan)).round(2)
 
-flex_share = {"RB": 0.45, "WR": 0.45, "TE": 0.10}
-starters = {
-    "QB": teams * qb_slots,
-    "RB": teams * rb_slots + flex_slots * teams * flex_share["RB"],
-    "WR": teams * wr_slots + flex_slots * teams * flex_share["WR"],
-    "TE": teams * te_slots + flex_slots * teams * flex_share["TE"],
-}
-
-replacement_pts = {}
-for pos, n in starters.items():
-    pos_pts = df.loc[df["position"] == pos, "proj_pts"].sort_values(ascending=False)
-    idx = min(max(int(round(n)), 1), len(pos_pts)) - 1
-    replacement_pts[pos] = float(pos_pts.iloc[idx]) if len(pos_pts) else 0.0
-
-df["vor"] = (df["proj_pts"] - df["position"].map(replacement_pts)).round(1)
+starters, repl = pj.replacement_levels(
+    df, teams, qb_slots, rb_slots, wr_slots, te_slots, flex_slots, superflex_slots
+)
+df["vor"] = (df["proj_pts"] - df["position"].map(repl)).round(1)
 df = df.sort_values("vor", ascending=False).reset_index(drop=True)
 df["overall_rank"] = df.index + 1
 df["pos_rank"] = df.groupby("position")["proj_pts"].rank(ascending=False, method="first").astype(int)
+df["tier"] = df.groupby("position", group_keys=False).apply(pj.assign_tiers).astype(int)
 
+has_adp = "adp" in df.columns and df["adp"].notna().any()
+has_injury = "injury" in df.columns
+has_sos = "sos_pctl" in df.columns and df["sos_pctl"].notna().any()
+has_pass_rate = "pass_rate" in df.columns and df["pass_rate"].notna().any()
 
-def assign_tiers(group: pd.DataFrame) -> pd.Series:
-    """Gap-based tiers within a position: a new tier starts at unusually large point drops."""
-    g = group.sort_values("proj_pts", ascending=False)
-    pts = g["proj_pts"].to_numpy()
-    if len(pts) < 3:
-        return pd.Series(1, index=g.index)
-    gaps = -np.diff(pts)
-    threshold = max(gaps.mean() + gaps.std(), 1e-9)
-    tiers = np.concatenate([[1], 1 + np.cumsum(gaps > threshold)])
-    return pd.Series(np.minimum(tiers, 8), index=g.index)
-
-
-df["tier"] = df.groupby("position", group_keys=False).apply(assign_tiers).astype(int)
+if has_adp:
+    df["adp_value"] = (df["adp"] - df["overall_rank"]).round(0)
 
 # ----------------------------------------------------------------------------
 # Tabs
 # ----------------------------------------------------------------------------
-tab_rank, tab_compare, tab_pos, tab_cheat = st.tabs(
-    ["📋 Rankings", "⚖️ Compare Players", "📊 Position Analysis", "📥 Cheat Sheet"]
-)
+tab_rank, tab_strategy, tab_news, tab_compare, tab_pos, tab_teams, tab_cheat = st.tabs([
+    "📋 Rankings", "🎯 Draft Strategy", "🏥 News & Injuries",
+    "⚖️ Compare", "📊 Positions", "🏟️ Teams", "📥 Cheat Sheet",
+])
 
+RENAME = {
+    "overall_rank": "Rank", "player": "Player", "team": "Team", "position": "Pos",
+    "pos_rank": "Pos Rank", "tier": "Tier", "proj_pts": "Proj Pts", "ppg": "PPG",
+    "vor": "VOR", "adp": "ADP", "adp_value": "Value vs ADP", "injury": "Injury",
+    "sos_pctl": "SOS", "pass_rate": "Team Pass %", "weeks_out": "Wks Out (LY)",
+}
+
+# --- Rankings ---
 with tab_rank:
     c1, c2, c3 = st.columns([2, 2, 3])
     pos_filter = c1.multiselect("Positions", POSITIONS, default=POSITIONS)
@@ -312,92 +234,159 @@ with tab_rank:
         view = view[view["player"].str.contains(search, case=False, na=False)]
     view = view.head(top_n)
 
-    show_cols = [
-        "overall_rank", "player", "team", "position", "pos_rank", "tier",
-        "proj_pts", "ppg", "vor",
-    ]
+    cols = ["overall_rank", "player", "team", "position", "pos_rank", "tier", "proj_pts", "ppg", "vor"]
+    if has_adp:
+        cols += ["adp", "adp_value"]
+    if has_injury:
+        cols += ["injury"]
+    if has_sos:
+        cols += ["sos_pctl"]
+
     st.dataframe(
-        view[show_cols].rename(columns={
-            "overall_rank": "Rank", "player": "Player", "team": "Team",
-            "position": "Pos", "pos_rank": "Pos Rank", "tier": "Tier",
-            "proj_pts": "Proj Pts", "ppg": "PPG", "vor": "VOR",
-        }),
-        width="stretch",
-        hide_index=True,
-        height=560,
+        view[cols].rename(columns=RENAME), width="stretch", hide_index=True, height=560,
+        column_config={
+            "SOS": st.column_config.NumberColumn(
+                help="Strength of schedule percentile, 100 = easiest. Based on fantasy points "
+                     "each opponent's defense allowed to this position last season."),
+            "Value vs ADP": st.column_config.NumberColumn(
+                help="Market ADP minus your projection rank. Positive = the market lets this "
+                     "player fall past where your numbers rank them."),
+        },
     )
     st.caption(
         "Replacement levels — " + " · ".join(
-            f"{p}: {replacement_pts[p]:.0f} pts (≈{starters[p]:.0f} starters)" for p in POSITIONS
-        )
+            f"{p}: {repl[p]:.0f} pts (≈{starters[p]:.0f} starters)" for p in POSITIONS)
+        + (f" · Superflex: {superflex_slots} slot(s) routed ~80% to QB demand" if superflex_slots else "")
     )
 
-with tab_compare:
-    picks = st.multiselect(
-        "Pick 2–6 players to compare",
-        options=df["player"].tolist(),
-        default=df["player"].head(3).tolist(),
-        max_selections=6,
+# --- Draft Strategy ---
+with tab_strategy:
+    strategy_md = pj.generate_strategy(
+        df, int(teams), starters, repl, int(superflex_slots),
+        pts_per_rec, te_bonus, pass_td_pts, has_adp,
     )
+    st.markdown(strategy_md)
+
+# --- News & Injuries ---
+with tab_news:
+    if not has_injury and source == "nflverse (live)":
+        st.info("Enable “Injury status & history” in the sidebar to load this tab.")
+    elif not has_injury:
+        st.info("Injury data requires the live nflverse source.")
+    else:
+        st.markdown("Current injury status from Sleeper, last-season injury report history from "
+                    "nflverse, and a news search link per player.")
+        inj_view = df[df["injury"].notna() | (df.get("weeks_out", pd.Series(dtype=float)).fillna(0) > 0)].copy()
+        only_top = st.checkbox("Only players in my draft range", value=True,
+                               help=f"Top {int(teams) * 15} overall")
+        if only_top:
+            inj_view = inj_view[inj_view["overall_rank"] <= int(teams) * 15]
+
+        inj_view["news_link"] = inj_view["player"].map(
+            lambda p: "https://news.google.com/search?q=" + urllib.parse.quote(f"{p} NFL injury")
+        )
+        cols = ["overall_rank", "player", "team", "position", "injury"]
+        if "injury_notes" in inj_view.columns:
+            cols.append("injury_notes")
+        if "weeks_out" in inj_view.columns:
+            cols.append("weeks_out")
+        if "news_updated" in inj_view.columns:
+            cols.append("news_updated")
+        cols.append("news_link")
+
+        st.dataframe(
+            inj_view[cols].rename(columns={**RENAME, "injury_notes": "Notes",
+                                           "news_updated": "Last News", "news_link": "Search News"}),
+            width="stretch", hide_index=True, height=500,
+            column_config={"Search News": st.column_config.LinkColumn(display_text="🔎 News")},
+        )
+        st.caption("“Wks Out (LY)” = weeks listed Out/Doubtful/IR on last season's official injury "
+                   "reports. Always verify status close to your draft — camp news moves fast.")
+
+# --- Compare ---
+with tab_compare:
+    picks = st.multiselect("Pick 2–6 players to compare", options=df["player"].tolist(),
+                           default=df["player"].head(3).tolist(), max_selections=6)
     if len(picks) >= 2:
         comp = df[df["player"].isin(picks)]
         fig = go.Figure()
-        fig.add_bar(
-            x=comp["player"], y=comp["proj_pts"],
-            marker_color=[POSITION_COLORS[p] for p in comp["position"]],
-            text=comp["proj_pts"], textposition="outside",
-        )
+        fig.add_bar(x=comp["player"], y=comp["proj_pts"],
+                    marker_color=[POSITION_COLORS[p] for p in comp["position"]],
+                    text=comp["proj_pts"], textposition="outside")
         fig.update_layout(title="Projected season points", yaxis_title="Points", height=400)
         st.plotly_chart(fig, width="stretch")
 
-        detail_cols = ["player", "team", "position", "games", "proj_pts", "ppg", "vor", "tier"] + STAT_COLUMNS
-        st.dataframe(comp[detail_cols].round(1), width="stretch", hide_index=True)
+        cols = ["player", "team", "position", "games", "proj_pts", "ppg", "vor", "tier"]
+        for c in ["adp", "injury", "sos_pctl", "pass_rate"]:
+            if c in comp.columns:
+                cols.append(c)
+        cols += DISPLAY_STATS
+        st.dataframe(comp[cols].rename(columns=RENAME).round(1), width="stretch", hide_index=True)
     else:
         st.info("Select at least two players to compare.")
 
+# --- Positions ---
 with tab_pos:
     pos = st.selectbox("Position", POSITIONS)
     pos_df = df[df["position"] == pos].sort_values("proj_pts", ascending=False).head(36)
-
-    fig = px.bar(
-        pos_df, x="player", y="proj_pts", color="tier",
-        color_continuous_scale="Viridis",
-        title=f"{pos} projected points by tier",
-        labels={"proj_pts": "Projected points", "player": ""},
-    )
-    fig.add_hline(
-        y=replacement_pts[pos], line_dash="dash", line_color="red",
-        annotation_text="Replacement level",
-    )
+    fig = px.bar(pos_df, x="player", y="proj_pts", color="tier",
+                 color_continuous_scale="Viridis",
+                 title=f"{pos} projected points by tier",
+                 labels={"proj_pts": "Projected points", "player": ""})
+    fig.add_hline(y=repl[pos], line_dash="dash", line_color="red", annotation_text="Replacement level")
     fig.update_layout(height=460, xaxis_tickangle=-45)
     st.plotly_chart(fig, width="stretch")
-
     if len(pos_df):
-        drop = pos_df["proj_pts"].iloc[0] - replacement_pts[pos]
-        st.metric(
-            f"Scarcity at {pos}",
-            f"{drop:.0f} pts",
-            help="Gap between the top player and replacement level — bigger gap means "
-                 "the position is more worth reaching for early.",
-        )
+        st.metric(f"Scarcity at {pos}", f"{pos_df['proj_pts'].iloc[0] - repl[pos]:.0f} pts",
+                  help="Gap between the top player and replacement level.")
 
+# --- Teams ---
+with tab_teams:
+    if tendencies is None:
+        st.info("Team tendencies require the live nflverse source.")
+    else:
+        st.markdown(f"**Offensive philosophy, {LAST_COMPLETE_SEASON} season** — pass rate as a share "
+                    "of pass attempts + carries. Pass-heavy teams support more fantasy-relevant "
+                    "receivers; run-heavy teams concentrate value in their backfield.")
+        fig = px.bar(tendencies, x="team", y="pass_rate", title="Team pass rate (%)",
+                     labels={"pass_rate": "Pass %", "team": ""})
+        fig.add_hline(y=tendencies["pass_rate"].mean(), line_dash="dash",
+                      annotation_text="League average")
+        fig.update_layout(height=420)
+        st.plotly_chart(fig, width="stretch")
+        if has_sos and sos is not None:
+            st.markdown(f"**Strength of schedule, {UPCOMING_SEASON}** — average opponent generosity "
+                        "to each position (percentile; 100 = easiest schedule).")
+            sos_wide = sos.pivot(index="team", columns="position", values="sos_pctl")[POSITIONS]
+            st.dataframe(sos_wide.style.background_gradient(cmap="RdYlGn", axis=None),
+                         width="stretch", height=450)
+        st.caption("A reminder these are last-season tendencies — new coordinators and QB changes "
+                   "can shift a team's identity. Treat as context, not gospel.")
+
+# --- Cheat Sheet ---
 with tab_cheat:
-    st.markdown("Download a draft-day cheat sheet ranked by value over replacement.")
-    sheet = df[[
-        "overall_rank", "player", "team", "position", "pos_rank", "tier", "proj_pts", "ppg", "vor"
-    ]]
+    st.markdown("Everything in one download: rankings with all enrichments, plus your "
+                "settings-specific draft strategy as a separate notes file.")
+    cols = ["overall_rank", "player", "team", "position", "pos_rank", "tier", "proj_pts", "ppg", "vor"]
+    for c in ["adp", "adp_value", "injury", "weeks_out", "sos_pctl", "pass_rate"]:
+        if c in df.columns:
+            cols.append(c)
+    sheet = df[cols].rename(columns=RENAME)
+
     buf = io.StringIO()
     sheet.to_csv(buf, index=False)
-    st.download_button(
-        "Download cheat sheet (CSV)",
-        buf.getvalue(),
-        file_name="draft_cheat_sheet.csv",
-        mime="text/csv",
-    )
+    d1, d2 = st.columns(2)
+    d1.download_button("📥 Cheat sheet (CSV)", buf.getvalue(),
+                       file_name="draft_cheat_sheet.csv", mime="text/csv")
+    strategy_md = pj.generate_strategy(df, int(teams), starters, repl, int(superflex_slots),
+                                       pts_per_rec, te_bonus, pass_td_pts, has_adp)
+    d2.download_button("📥 Draft strategy notes (Markdown)",
+                       f"# Draft Strategy\n\n{strategy_md}",
+                       file_name="draft_strategy.md", mime="text/markdown")
     st.dataframe(sheet.head(50), width="stretch", hide_index=True)
 
 st.caption(
-    "Projections are recency-weighted per-game averages from real nflverse stats — a solid "
-    "baseline, but they don't know about trades, rookies' situations, or coaching changes. "
-    "Adjust with your own judgment."
+    "Projections are recency-weighted per-game averages from real stats, with TD regression. They "
+    "can't see trades, rookies, or scheme changes — use the Teams and News tabs as context and "
+    "adjust with your own judgment."
 )

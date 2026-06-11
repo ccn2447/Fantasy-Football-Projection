@@ -1,6 +1,6 @@
 # Fantasy Football Projection Tool
 
-A Streamlit app that pulls **real NFL stats automatically from nflverse** (free, public, no API key) and turns them into fantasy projections, value-over-replacement rankings, tiers, and a draft cheat sheet. No CSV needed.
+A Streamlit app that builds fantasy projections from real NFL data and generates a draft strategy tailored to your exact league settings — including superflex.
 
 ## Quick start
 
@@ -9,25 +9,41 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Opens at http://localhost:8501. The first load downloads a few seasons of stats (takes a moment), then it's cached for 24 hours.
+Keep all four Python/CSV files in the same folder. First load downloads a few seasons of stats; everything is cached for 12–24 hours.
 
-## How projections work
+## Data sources (all free, no API keys)
 
-1. Downloads weekly player stats for the seasons you select (sidebar slider)
-2. Aggregates to per-game rates for each player-season
-3. Combines seasons with recency weighting (last season counts 2x the one before, 4x the one before that, also weighted by games played)
-4. Multiplies by your projected games setting (default 16 to bake in typical injury risk)
-5. Filters to players active in the most recent season with enough games for a reliable sample
+| Source | Provides |
+|---|---|
+| nflverse | Real weekly NFL stats, upcoming-season schedules, official injury reports |
+| Sleeper API | Current injury status and body part, news recency |
+| FantasyFootballCalculator | Market ADP (PPR / Half / Standard / 2QB-superflex) |
 
-## Features
+Each source degrades gracefully — if one is unreachable, its columns are hidden and the rest of the app works.
 
-- **Live data** — real stats from nflverse, refreshed daily; sample-data mode works offline
-- **Custom scoring** — PPR / Half PPR / Standard presets or fully custom values
-- **VOR rankings** — value over the replacement-level player, based on your league size and roster (flex demand split 45/45/10 across RB/WR/TE)
-- **Tiers** — gap-based tiering shows where the talent cliffs are at each position
-- **Compare players** and **position scarcity** views
-- **Cheat sheet export** — CSV download for draft day
+## Projection model
 
-## Limitations worth knowing
+1. Weekly stats → per-game rates per player-season
+2. Recency-weighted blend across your chosen seasons (last season counts 2× the prior one)
+3. **TD regression**: touchdown rates are the noisiest stat year over year, so each player's TD rate is pulled partway toward the position average (adjustable slider, default 30%)
+4. Scaled to your projected-games setting (default 16 to bake in injury risk)
+5. Filtered to players active last season with enough games for a reliable sample
 
-These are stat-based baseline projections. They don't know about offseason trades, rookies (no NFL stats yet), new coaching schemes, or suspensions. Treat them as a starting point and adjust with your own judgment.
+## League-aware valuation
+
+- **Superflex**: superflex slots route ~80% of their demand to QB, which drops QB replacement level and surfaces QBs much higher in the rankings — exactly how real superflex drafts behave
+- **Scoring**: full custom scoring including a TE-premium reception bonus; every downstream number (rankings, VOR, tiers, defense ratings, strategy) uses *your* scoring
+- **VOR**: value over the replacement-level player given your league size and roster
+
+## Tabs
+
+- **Rankings** — VOR-ranked board with ADP, value-vs-ADP, injury status, and SOS columns
+- **Draft Strategy** — auto-generated from your settings: position priority by scarcity, superflex QB timing, tier cliffs by round, market values and reaches vs ADP, injury flags in your draft range
+- **News & Injuries** — current status (Sleeper), weeks missed last season (nflverse), and a news search link per player
+- **Compare / Positions** — head-to-head charts and tier visualizations with the replacement line
+- **Teams** — each team's pass/run rate and a position-by-position strength-of-schedule heatmap
+- **Cheat Sheet** — one CSV with everything, plus your strategy notes as a Markdown download
+
+## Honest limitations
+
+Stat-based projections can't see offseason trades, rookies (no NFL stats yet), or coaching changes. SOS uses last season's defenses, and team tendencies can shift with new coordinators. The Teams and News tabs exist precisely so you can sanity-check the numbers against the real-world situation.
