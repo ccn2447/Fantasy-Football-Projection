@@ -9,7 +9,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Keep all four Python/CSV files in the same folder. First load downloads a few seasons of stats; everything is cached for 12–24 hours.
+Keep all the Python files in the same folder. First load downloads a few seasons of stats; everything is cached for 12–24 hours.
 
 ## Data sources (all free, no API keys)
 
@@ -18,6 +18,7 @@ Keep all four Python/CSV files in the same folder. First load downloads a few se
 | nflverse | Real weekly NFL stats, upcoming-season schedules, official injury reports |
 | Sleeper API | Current injury status and body part, news recency |
 | FantasyFootballCalculator | Market ADP (PPR / Half / Standard / 2QB-superflex) |
+| Open-Meteo | Kickoff temperature, wind and precipitation for outdoor games (~2 weeks out) |
 
 Each source degrades gracefully — if one is unreachable, its columns are hidden and the rest of the app works.
 
@@ -38,12 +39,52 @@ Each source degrades gracefully — if one is unreachable, its columns are hidde
 ## Tabs
 
 - **Rankings** — VOR-ranked board with ADP, value-vs-ADP, injury status, and SOS columns
+- **Mock Draft** — simulate your draft from your real slot, either start-to-finish or pick-by-pick
+- **Weekly** — week-by-week projections driven by matchup, game script, injuries and weather
 - **Draft Strategy** — auto-generated from your settings: position priority by scarcity, superflex QB timing, tier cliffs by round, market values and reaches vs ADP, injury flags in your draft range
 - **News & Injuries** — current status (Sleeper), weeks missed last season (nflverse), and a news search link per player
 - **Compare / Positions** — head-to-head charts and tier visualizations with the replacement line
 - **Teams** — each team's pass/run rate and a position-by-position strength-of-schedule heatmap
 - **Cheat Sheet** — one CSV with everything, plus your strategy notes as a Markdown download
 
+## Mock draft
+
+The other managers draft off a blended board — market ADP mixed with your own projections — plus
+Gaussian noise and roster-need logic. Two sliders control the room: how much it trusts ADP vs your
+numbers, and how unpredictable managers are. Because the projections side of the board is already
+superflex- and scoring-aware, a superflex league produces a superflex-shaped draft with no special
+casing (QBs go in the first three rounds instead of the fifth).
+
+- **Simulate the whole draft** — your roster and best legal starting lineup, a draft grade against
+  the other teams, the full board, and every pick with its reach/value vs ADP
+- **Draft interactively** — the sim pauses on every one of your picks; take the player you want,
+  auto-pick, or reset
+- **Monte Carlo availability** — run 10–200 drafts and see the probability each player is still on
+  the board at each of *your* picks. Anyone near 50% is the real decision point
+
+## Weekly projections
+
+Each player's season per-game average is moved week to week by multipliers you can see and turn off:
+
+| Factor | Source |
+|---|---|
+| Matchup | Opponent's fantasy points allowed to that position vs league average |
+| Game script | Vegas spread — underdogs throw more, favorites run more |
+| Implied total | Vegas total + spread → expected points for that offense |
+| Team pass-rate outlook | Your own editable pass-rate projection per team (new OC or QB) |
+| Injuries | Sleeper status for the player, applied to week 1 or all weeks |
+| Vacated volume | Points freed up by injured teammates at the same position, redistributed |
+| Weather | Wind, cold and precipitation at kickoff, outdoor games only |
+| Home / away | Small fixed edge |
+
+Weather and game-script effects are applied against each player's passing/receiving vs rushing
+split, so wind hurts a pocket passer far more than a goal-line back. Byes come straight from the
+schedule and show as zero. Every factor falls back to 1.0 when its source is unavailable.
+
 ## Honest limitations
 
-Stat-based projections can't see offseason trades, rookies (no NFL stats yet), or coaching changes. SOS uses last season's defenses, and team tendencies can shift with new coordinators. The Teams and News tabs exist precisely so you can sanity-check the numbers against the real-world situation.
+Stat-based projections can't see offseason trades, rookies (no NFL stats yet), or coaching changes —
+the editable pass-rate outlook in the Weekly tab is the one lever for the last of those. SOS uses last season's defenses, and team tendencies can shift with new coordinators. The Teams and News tabs exist precisely so you can sanity-check the numbers against the real-world
+situation. Weather forecasts only reach about two weeks out, so late-season weather columns are
+empty until the season is underway, and defensive matchup ratings are last season's — week 14 is a
+sketch, not a lineup decision.

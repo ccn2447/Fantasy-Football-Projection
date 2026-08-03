@@ -19,7 +19,9 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import data_sources as ds
+import mock_draft as md
 import projections as pj
+import weekly as wk
 from data_sources import POSITIONS
 
 st.set_page_config(page_title="Fantasy Football Projections", page_icon="🏈", layout="wide")
@@ -56,8 +58,10 @@ if source == "nflverse (live)":
     )
     enrich = st.sidebar.multiselect(
         "Extra data (each adds a download)",
-        ["Injury status & history", "Strength of schedule", "Market ADP"],
-        default=["Injury status & history", "Strength of schedule", "Market ADP"],
+        ["Injury status & history", "Strength of schedule", "Market ADP",
+         "Week-by-week schedule & weather"],
+        default=["Injury status & history", "Strength of schedule", "Market ADP",
+                 "Week-by-week schedule & weather"],
     )
 else:
     enrich = []
@@ -93,6 +97,14 @@ with st.sidebar.expander("Scoring details", expanded=(scoring_preset == "Custom"
     fumble_pts = st.number_input("Fumble lost", -5.0, 0.0, -2.0, 0.5)
 
 
+SCORING = dict(
+    pts_per_rec=pts_per_rec, te_bonus=te_bonus, pass_yds_per_pt=pass_yds_per_pt,
+    pass_td_pts=pass_td_pts, int_pts=int_pts, rush_yds_per_pt=rush_yds_per_pt,
+    rush_td_pts=rush_td_pts, rec_yds_per_pt=rec_yds_per_pt, rec_td_pts=rec_td_pts,
+    fumble_pts=fumble_pts,
+)
+
+
 def score(d: pd.DataFrame) -> pd.Series:
     rec_pts = d["receptions"] * pts_per_rec
     if te_bonus > 0 and "position" in d.columns:
@@ -111,7 +123,7 @@ def score(d: pd.DataFrame) -> pd.Series:
 # ----------------------------------------------------------------------------
 st.title("Fantasy Football Projection Tool")
 
-tendencies = sos = None
+tendencies = sos = ratings = games = game_weather = None
 if source == "nflverse (live)":
     seasons = list(range(season_range[0], season_range[1] + 1))
     try:
@@ -146,10 +158,13 @@ if source == "nflverse (live)":
         else:
             sources_down.append("nflverse injury history")
 
+    # Defense ratings — shared by strength of schedule and the weekly model
+    if {"Strength of schedule", "Week-by-week schedule & weather"} & set(enrich):
+        ratings = ds.defense_ratings(weekly, max(seasons), score)
+
     # Strength of schedule
     if "Strength of schedule" in enrich:
         with st.spinner("Computing strength of schedule…"):
-            ratings = ds.defense_ratings(weekly, max(seasons), score)
             schedule = ds.load_schedule_opponents(UPCOMING_SEASON)
         if ratings is not None and schedule is not None:
             sos = ds.compute_sos(schedule, ratings)
@@ -171,13 +186,30 @@ if source == "nflverse (live)":
         else:
             sources_down.append("FantasyFootballCalculator ADP")
 
+    # Week-by-week schedule + weather
+    if "Week-by-week schedule & weather" in enrich:
+        with st.spinner(f"Loading the {UPCOMING_SEASON} week-by-week schedule…"):
+            games = ds.load_schedule_games(UPCOMING_SEASON)
+        if games is not None:
+            sources_ok.append(f"{UPCOMING_SEASON} schedule ({games['week'].max()} weeks)")
+            game_weather = ds.load_game_weather(games)
+            if game_weather is not None:
+                sources_ok.append(f"Open-Meteo forecast ({len(game_weather)} games)")
+        else:
+            sources_down.append(f"{UPCOMING_SEASON} week-by-week schedule")
+
     msg = f"Loaded: {', '.join(sources_ok)}."
     if sources_down:
         st.warning(msg + f" Unavailable right now: {', '.join(sources_down)} — those columns are hidden.")
     else:
         st.success(msg)
 else:
-    df = pd.read_csv("sample_projections.csv")
+    try:
+        df = pd.read_csv("sample_projections.csv")
+    except FileNotFoundError:
+        st.error("`sample_projections.csv` isn't in this folder. Switch the data source to "
+                 "**nflverse (live)** in the sidebar, or drop a sample CSV next to `app.py`.")
+        st.stop()
     df["player_id"] = df["player"]
     st.info("Using bundled **sample data** (demo numbers only — live extras like injuries/SOS/ADP need the nflverse source).")
 
@@ -210,9 +242,10 @@ if has_adp:
 # ----------------------------------------------------------------------------
 # Tabs
 # ----------------------------------------------------------------------------
-tab_rank, tab_strategy, tab_news, tab_compare, tab_pos, tab_teams, tab_cheat = st.tabs([
-    "📋 Rankings", "🎯 Draft Strategy", "🏥 News & Injuries",
-    "⚖️ Compare", "📊 Positions", "🏟️ Teams", "📥 Cheat Sheet",
+(tab_rank, tab_strategy, tab_mock, tab_week, tab_news, tab_compare,
+ tab_pos, tab_teams, tab_cheat) = st.tabs([
+    "📋 Rankings", "🎯 Draft Strategy", "🕹️ Mock Draft", "📅 Weekly",
+    "🏥 News & Injuries", "⚖️ Compare", "📊 Positions", "🏟️ Teams", "📥 Cheat Sheet",
 ])
 
 RENAME = {
@@ -266,6 +299,313 @@ with tab_strategy:
         pts_per_rec, te_bonus, pass_td_pts, has_adp,
     )
     st.markdown(strategy_md)
+
+# --- Mock Draft ---
+with tab_mock:
+    st.markdown(
+        "Simulate your draft from your real draft slot. The other managers pick off a blend of "
+        "market ADP and your own projections, with noise and roster-need logic — so a superflex "
+        "or TE-premium league produces a superflex or TE-premium draft automatically."
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    my_slot = c1.number_input("Your draft slot", 1, int(teams), min(4, int(teams)), key="md_slot")
+    rounds = c2.number_input("Rounds", 4, 25, 15, key="md_rounds")
+    adp_weight = c3.slider(
+        "Board: your projections ↔ market ADP", 0.0, 1.0, 0.6 if has_adp else 0.0, 0.1,
+        disabled=not has_adp, key="md_adp_weight",
+        help="0 = the room drafts entirely off your numbers. 1 = entirely off market ADP. "
+             "Somewhere in the middle is the most realistic.",
+    )
+    sigma = c4.slider("Manager unpredictability", 0.0, 15.0, 6.0, 0.5, key="md_sigma",
+                      help="Standard deviation of how far a manager reaches or waits, in board ranks.")
+
+    c5, c6, c7 = st.columns([3, 3, 2])
+    strategy = c5.selectbox("Your auto-pick strategy", md.STRATEGIES, key="md_strategy")
+    mode = c6.radio("Mode", ["Simulate the whole draft", "Draft interactively"], horizontal=True,
+                    key="md_mode")
+    seed = c7.number_input("Seed", 0, 9999, 7, key="md_seed", help="Same seed = same draft. Change it for a new room.")
+
+    cfg = md.DraftConfig(
+        teams=int(teams), rounds=int(rounds), my_slot=int(my_slot), adp_weight=float(adp_weight),
+        sigma=float(sigma), my_strategy=strategy, qb_slots=int(qb_slots), rb_slots=int(rb_slots),
+        wr_slots=int(wr_slots), te_slots=int(te_slots), flex_slots=int(flex_slots),
+        superflex_slots=int(superflex_slots), seed=int(seed), starters=starters,
+    )
+    pool = md.build_pool(df, cfg)
+    st.caption("Your picks: " + ", ".join(str(p) for p in md.my_pick_numbers(cfg)))
+
+    PICK_COLS = ["pick", "round", "manager", "player", "position", "nfl_team", "proj_pts", "vor"]
+
+    def show_my_team(picks_df: pd.DataFrame, grades: pd.DataFrame) -> None:
+        mine = picks_df[picks_df["manager"] == "YOU"]
+        if mine.empty:
+            return
+        row = grades[grades["manager"] == "YOU"].iloc[0]
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Projected starting lineup", f"{row['starter_pts']:.0f} pts",
+                  f"{row['starter_pts'] - grades['starter_pts'].mean():+.0f} vs league average")
+        m2.metric("Draft grade", f"#{int(row['draft_rank'])} of {int(teams)}")
+        m3.metric("Bench points", f"{row['bench_pts']:.0f}")
+
+        lineup = md.starting_lineup(mine, cfg)
+        left, right = st.columns([3, 2])
+        left.dataframe(
+            lineup[["lineup_slot", "pick", "player", "position", "nfl_team", "proj_pts", "vor"]]
+            .rename(columns={"lineup_slot": "Slot", "pick": "Pick", "player": "Player",
+                             "position": "Pos", "nfl_team": "Team", "proj_pts": "Proj Pts",
+                             "vor": "VOR"}),
+            width="stretch", hide_index=True, height=430,
+        )
+        counts = mine["position"].value_counts().reindex(POSITIONS).fillna(0).reset_index()
+        counts.columns = ["position", "n"]
+        fig = px.bar(counts, x="position", y="n", color="position",
+                     color_discrete_map=POSITION_COLORS, title="Roster composition")
+        fig.update_layout(height=430, showlegend=False, yaxis_title="Players")
+        right.plotly_chart(fig, width="stretch")
+
+    if mode == "Simulate the whole draft":
+        state = md.simulate_full(cfg, pool)
+        picks = md.results_frame(state, pool, cfg)
+        grades = md.grade_teams(picks, cfg)
+        show_my_team(picks, grades)
+
+        st.markdown("**League draft grades** — projected points from each team's best legal lineup.")
+        st.dataframe(
+            grades[["draft_rank", "manager", "starter_pts", "bench_pts", "total_vor"]]
+            .rename(columns={"draft_rank": "#", "manager": "Manager", "starter_pts": "Starters",
+                             "bench_pts": "Bench", "total_vor": "Total VOR"}),
+            width="stretch", hide_index=True, height=min(420, 40 + 35 * int(teams)),
+        )
+
+        with st.expander("Full draft board"):
+            st.dataframe(md.board_grid(picks, cfg), width="stretch", height=520)
+        with st.expander("Every pick"):
+            st.dataframe(picks[PICK_COLS + (["adp", "reach"] if has_adp else [])],
+                         width="stretch", hide_index=True, height=520)
+
+        with st.expander("Who will actually be there at your picks? (Monte Carlo)", expanded=False):
+            s1, s2 = st.columns([1, 3])
+            n_sims = s1.slider("Drafts to simulate", 10, 200, 50, 10, key="md_nsims")
+            if s1.button("Run simulations", type="primary", key="md_run"):
+                with st.spinner(f"Simulating {n_sims} drafts…"):
+                    st.session_state["md_avail"] = md.availability(cfg, pool, n_sims=int(n_sims), top_n=48)
+            av = st.session_state.get("md_avail")
+            if av is not None and len(av):
+                pcols = [c for c in av.columns if c.startswith("P") and c[1:].isdigit()]
+                heat = av.set_index(av["player"] + " (" + av["position"] + ")")[pcols]
+                fig = px.imshow(heat, color_continuous_scale="RdYlGn", aspect="auto", zmin=0, zmax=1,
+                                labels={"x": "Your pick #", "y": "", "color": "P(available)"},
+                                text_auto=".0%")
+                fig.update_layout(height=max(400, 18 * len(heat)),
+                                  title="Probability the player is still on the board")
+                fig.update_xaxes(side="top", tickvals=pcols, ticktext=[c[1:] for c in pcols])
+                st.plotly_chart(fig, width="stretch")
+                st.caption("Green = likely available. Anyone at ~50% is a genuine decision point: "
+                           "take them now or plan a fallback.")
+            else:
+                s2.info("Run the simulations to see availability probabilities at each of your picks.")
+
+    else:
+        cfg_key = (cfg.teams, cfg.rounds, cfg.my_slot, cfg.adp_weight, cfg.sigma,
+                   cfg.my_strategy, cfg.seed, cfg.superflex_slots, len(pool))
+        if st.session_state.get("md_key") != cfg_key:
+            st.session_state["md_key"] = cfg_key
+            st.session_state["md_state"] = md.new_state(cfg, len(pool))
+            md.run_to(st.session_state["md_state"], pool, cfg)
+        state = st.session_state["md_state"]
+
+        done = state["pick_no"] > cfg.n_picks
+        picks = md.results_frame(state, pool, cfg)
+
+        if not done:
+            rnd = int(np.ceil(state["pick_no"] / cfg.teams))
+            st.subheader(f"On the clock — pick {state['pick_no']} (round {rnd})")
+            avail = pool[~state["taken"]].sort_values("vor", ascending=False)
+            b1, b2, b3, b4 = st.columns([4, 1.2, 1.2, 1.2])
+            options = avail.head(60)
+            labels = [f"{r['player']} · {r['position']} · {r['proj_pts']:.0f} pts (VOR {r['vor']:.0f})"
+                      for _, r in options.iterrows()]
+            chosen = b1.selectbox("Best available", labels, key="md_choice")
+            if b2.button("Draft", type="primary", key="md_draft"):
+                idx = int(options.index[labels.index(chosen)])
+                md.step(state, pool, cfg, forced_idx=idx)
+                md.run_to(state, pool, cfg)
+                st.rerun()
+            if b3.button("Auto-pick", key="md_auto"):
+                md.step(state, pool, cfg)
+                md.run_to(state, pool, cfg)
+                st.rerun()
+            if b4.button("Reset", key="md_reset"):
+                st.session_state.pop("md_key", None)
+                st.rerun()
+        else:
+            st.success("Draft complete.")
+            if st.button("Start a new draft", key="md_new"):
+                st.session_state.pop("md_key", None)
+                st.rerun()
+
+        if len(picks):
+            grades = md.grade_teams(picks, cfg)
+            show_my_team(picks, grades)
+            recent = picks.tail(int(teams) * 2)[PICK_COLS[:5]]
+            with st.expander("Recent picks", expanded=True):
+                st.dataframe(recent, width="stretch", hide_index=True, height=280)
+
+# --- Weekly projections ---
+with tab_week:
+    if games is None:
+        st.info("Enable **Week-by-week schedule & weather** in the sidebar (live nflverse source) "
+                "to build weekly projections.")
+    else:
+        st.markdown(
+            f"Per-game baselines moved week to week by matchup, game script, injuries and weather. "
+            f"Every factor is a visible multiplier on the player's season per-game average — "
+            f"switch any of them off below."
+        )
+
+        with st.expander("Model settings", expanded=False):
+            f1, f2, f3 = st.columns(3)
+            matchup_strength = f1.slider(
+                "Opponent matchup", 0.0, 1.0, 0.6 if ratings is not None else 0.0, 0.1,
+                disabled=ratings is None, key="wk_matchup",
+                help="How much of last season's difference in points allowed to carry forward. "
+                     "1.0 takes it at face value, which overrates it — defenses change.")
+            script_strength = f2.slider("Game script (spread)", 0.0, 1.0, 0.5, 0.1, key="wk_script",
+                                        help="Underdogs throw more; favorites run more.")
+            volume_strength = f3.slider("Implied team total", 0.0, 1.0, 0.4, 0.1, key="wk_volume",
+                                        help="Vegas total and spread → expected points for the offense.")
+            g1, g2, g3 = st.columns(3)
+            injury_mode = g1.radio("Current injuries apply to", ["Week 1 only", "All weeks", "Ignore"],
+                                   key="wk_injmode",
+                                   help="Sleeper reports today's status. Carrying a Questionable tag "
+                                        "through week 17 is usually wrong.")
+            use_weather = g2.checkbox("Use kickoff weather", value=True, key="wk_weather",
+                                      help="Open-Meteo forecasts reach about two weeks out; games "
+                                           "beyond that get no weather adjustment.")
+            home_field = g3.slider("Home-field edge", 0.0, 0.05, 0.02, 0.005, key="wk_hfa")
+
+        outlook = None
+        if tendencies is not None:
+            with st.expander("Team pass-rate outlook — the one thing the stats can't see"):
+                st.caption(
+                    "Projections inherit last season's offensive philosophy. If a team changed "
+                    "coordinator or quarterback, edit its projected pass rate here and every player "
+                    "on that offense shifts (receivers up, backs down, or the reverse)."
+                )
+                editable = tendencies[["team", "pass_rate"]].copy()
+                editable["projected_pass_rate"] = editable["pass_rate"]
+                outlook = st.data_editor(
+                    editable, hide_index=True, width="stretch", height=320, key="wk_outlook",
+                    disabled=["team", "pass_rate"],
+                    column_config={
+                        "team": "Team",
+                        "pass_rate": st.column_config.NumberColumn(
+                            f"{LAST_COMPLETE_SEASON} pass %", disabled=True, format="%.1f"),
+                        "projected_pass_rate": st.column_config.NumberColumn(
+                            f"{UPCOMING_SEASON} pass % (edit)", min_value=35.0, max_value=75.0,
+                            step=0.5, format="%.1f"),
+                    },
+                )
+
+        params = wk.WeeklyParams(
+            matchup_strength=matchup_strength, script_strength=script_strength,
+            volume_strength=volume_strength, home_field=home_field,
+            use_weather=use_weather, injury_mode=injury_mode,
+        )
+        weekly_df = wk.build_weekly(
+            df, games, SCORING, params, ratings=ratings,
+            weather=game_weather if use_weather else None,
+            pass_rate_outlook=outlook, top_n=300,
+        )
+
+        all_weeks = sorted(weekly_df["week"].unique())
+        w1, w2, w3 = st.columns([1, 2, 3])
+        week_pick = w1.selectbox("Week", all_weeks, key="wk_week")
+        pos_pick = w2.multiselect("Positions", POSITIONS, default=POSITIONS, key="wk_positions")
+        roster = w3.multiselect("Only my players (optional)", df["player"].tolist(), key="wk_roster")
+
+        wv = weekly_df[(weekly_df["week"] == week_pick) & (weekly_df["position"].isin(pos_pick))]
+        if roster:
+            wv = wv[wv["player"].isin(roster)]
+        wv = wv.sort_values("proj_pts_week", ascending=False).head(80)
+
+        WCOLS = {
+            "player": "Player", "position": "Pos", "team": "Team", "opponent": "Opp",
+            "proj_pts_week": "Week Pts", "ppg": "Season PPG", "delta_vs_avg": "Δ vs avg",
+            "matchup_mult": "Matchup", "script_mult": "Script", "volume_mult": "Total",
+            "injury_mult": "Injury", "vacancy_week": "Vacated", "weather_mult": "Weather",
+            "weather_note": "Conditions",
+        }
+        st.dataframe(
+            wv[list(WCOLS)].rename(columns=WCOLS).round(2), width="stretch", hide_index=True,
+            height=520,
+            column_config={
+                "Matchup": st.column_config.NumberColumn(
+                    help="Opponent's fantasy points allowed to this position vs league average."),
+                "Vacated": st.column_config.NumberColumn(
+                    help="Volume freed up by injured teammates at the same position."),
+            },
+        )
+        bye_teams = sorted(weekly_df.loc[(weekly_df["week"] == week_pick) & weekly_df["is_bye"], "team"].unique())
+        st.caption(f"Week {week_pick} byes: " + (", ".join(bye_teams) if bye_teams else "none"))
+
+        st.divider()
+        d1, d2 = st.columns([2, 3])
+        focus = d1.selectbox("Player detail", weekly_df["player"].drop_duplicates().tolist(), key="wk_focus")
+        focus_week = d2.select_slider("Break down which week?", all_weeks, value=week_pick, key="wk_bdweek")
+
+        pdata = weekly_df[weekly_df["player"] == focus].sort_values("week")
+        fig = go.Figure()
+        fig.add_bar(x=pdata["week"], y=pdata["proj_pts_week"],
+                    marker_color=np.where(pdata["is_bye"], "#bbbbbb", POSITION_COLORS.get(
+                        pdata["position"].iloc[0], "#888")),
+                    text=pdata["opponent"], hovertext=pdata["weather_note"])
+        fig.add_hline(y=float(pdata["ppg"].iloc[0]), line_dash="dash",
+                      annotation_text="Season average")
+        fig.update_layout(title=f"{focus} — projected points by week", height=380,
+                          xaxis_title="Week", yaxis_title="Points")
+        st.plotly_chart(fig, width="stretch")
+
+        bd = wk.factor_breakdown(weekly_df, focus, focus_week)
+        if len(bd):
+            b1, b2 = st.columns([2, 3])
+            b1.dataframe(bd.rename(columns={"factor": "Factor", "multiplier": "×",
+                                            "points": "Points"}),
+                         width="stretch", hide_index=True)
+            fig2 = px.bar(bd, x="points", y="factor", orientation="h",
+                          color=np.where(bd["points"] >= 0, "up", "down"),
+                          color_discrete_map={"up": "#17BEBB", "down": "#E4572E"},
+                          labels={"points": "Points vs season average", "factor": ""})
+            fig2.update_layout(height=320, showlegend=False, title=f"Week {focus_week} drivers")
+            b2.plotly_chart(fig2, width="stretch")
+
+        st.divider()
+        st.markdown("**Fantasy playoff stretch** — who gets easier weeks when it matters.")
+        p1, p2 = st.columns([2, 3])
+        playoff_weeks = p1.multiselect("Playoff weeks", all_weeks, key="wk_playoff",
+                                       default=[w for w in all_weeks if w >= max(all_weeks) - 3])
+        if playoff_weeks:
+            stretch = wk.stretch_summary(weekly_df, playoff_weeks, min_rank=int(teams) * 12)
+            p2.dataframe(
+                stretch.head(20).rename(columns={"player": "Player", "position": "Pos",
+                                                 "team": "Team", "stretch_ppg": "Stretch PPG",
+                                                 "season_ppg": "Season PPG", "edge": "Edge",
+                                                 "byes": "Byes"}),
+                width="stretch", hide_index=True, height=400,
+            )
+
+        buf_w = io.StringIO()
+        weekly_df[["week", "player", "position", "team", "opponent", "ppg", "proj_pts_week",
+                   "matchup_mult", "script_mult", "volume_mult", "injury_mult", "vacancy_week",
+                   "weather_mult", "weather_note", "is_bye"]].to_csv(buf_w, index=False)
+        st.download_button("📥 Weekly projections (CSV)", buf_w.getvalue(), key="wk_csv",
+                           file_name=f"weekly_projections_{UPCOMING_SEASON}.csv", mime="text/csv")
+        st.caption(
+            "Weather only adjusts games inside the forecast window and outdoors; everything else "
+            "shows as “No forecast yet”. Matchup ratings come from last season's defenses, so treat "
+            "week 14 as a rough sketch, not a lineup decision."
+        )
 
 # --- News & Injuries ---
 with tab_news:
