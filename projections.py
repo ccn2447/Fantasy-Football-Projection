@@ -23,13 +23,19 @@ def build_projections(
     projected_games: int,
     min_games: int,
     td_regression: float = 0.3,
+    active_seasons: list[int] | None = None,
 ) -> pd.DataFrame:
     """Recency-weighted per-game rates × projected games, with TD rates
-    regressed toward the position mean (TDs are the noisiest stat year-to-year)."""
+    regressed toward the position mean (TDs are the noisiest stat year-to-year).
+
+    `active_seasons` decides who counts as an active player. Defaults to the
+    latest season; in-season you want the last two, so a player who has been hurt
+    since week 1 doesn't vanish from the board."""
     latest = max(seasons)
     weights = {s: 0.5 ** (latest - s) for s in seasons}
 
-    d = season_stats[season_stats["games"] > 0].copy()
+    d = season_stats[(season_stats["games"] > 0)
+                     & season_stats["season"].isin(seasons)].copy()
     d["weight"] = d["season"].map(weights) * d["games"]
 
     for col in PROJ_STATS:
@@ -50,7 +56,8 @@ def build_projections(
 
     proj = d.groupby(["player_id", "player"]).apply(agg_player, include_groups=False).reset_index()
 
-    active_ids = set(season_stats.loc[season_stats["season"] == latest, "player_id"])
+    active = active_seasons or [latest]
+    active_ids = set(season_stats.loc[season_stats["season"].isin(active), "player_id"])
     proj = proj[proj["player_id"].isin(active_ids) & (proj["total_games"] >= min_games)].copy()
 
     # TD regression toward position mean

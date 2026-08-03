@@ -81,6 +81,28 @@ Weather and game-script effects are applied against each player's passing/receiv
 split, so wind hurts a pocket passer far more than a goal-line back. Byes come straight from the
 schedule and show as zero. Every factor falls back to 1.0 when its source is unavailable.
 
+## In-season mode
+
+Nothing needs editing when the season starts. The app reads the live schedule, works out which week
+is current, and offers an **in-season toggle** in the sidebar from the moment week 1 kicks off. With
+it on:
+
+- The season slider extends to the current year, so games being played now enter the projection
+  blend. Partial seasons are handled correctly — the model weights by games played, so three weeks
+  of data carries three weeks of influence
+- Matchup ratings blend current-year defenses into last year's, weighted `weeks_played /
+  (weeks_played + 6)` — about 45% current-year at week 6, 74% by week 17. Six games of defensive
+  data is too noisy to trust on its own
+- Projected games defaults to the weeks left on the schedule, so season totals become
+  rest-of-season totals
+- The Weekly tab opens on the current week and hides the weeks already played
+- A **rest-of-season table** totals every weekly adjustment across your remaining games — the
+  in-season equivalent of the Rankings tab, already accounting for byes, matchups and injuries
+- Players who haven't appeared yet this season stay on the board instead of being filtered out as
+  inactive
+
+Toggle it off at any point to get the preseason draft board back.
+
 ## Honest limitations
 
 Stat-based projections can't see offseason trades, rookies (no NFL stats yet), or coaching changes —

@@ -33,6 +33,11 @@ DISPLAY_STATS = ["pass_yds", "pass_td", "interceptions", "rush_yds", "rush_td",
 TODAY = datetime.date.today()
 LAST_COMPLETE_SEASON = TODAY.year - 1 if TODAY.month >= 3 else TODAY.year - 2
 UPCOMING_SEASON = LAST_COMPLETE_SEASON + 1
+CURRENT_SEASON = UPCOMING_SEASON          # the season whose schedule is live
+
+# Is the season underway? Detected from the schedule, so nothing needs editing
+# when week 1 kicks off.
+SEASON = ds.season_state(CURRENT_SEASON)
 
 # ----------------------------------------------------------------------------
 # Sidebar
@@ -42,13 +47,30 @@ st.sidebar.title("🏈 Settings")
 st.sidebar.subheader("Data source")
 source = st.sidebar.radio("Source", ["nflverse (live)", "Sample data (offline)"])
 
+if SEASON["started"] and not SEASON["complete"]:
+    in_season = st.sidebar.toggle(
+        f"In-season mode — {CURRENT_SEASON} week {SEASON['current_week']}", value=True,
+        help="Adds this season's games to the projection blend, mixes current-year defenses into "
+             "the matchup ratings, and points the Weekly tab at the games you still have left. "
+             "Turn it off to see the preseason board again.",
+    )
+else:
+    in_season = False
+
 if source == "nflverse (live)":
+    newest_season = CURRENT_SEASON if in_season else LAST_COMPLETE_SEASON
     season_range = st.sidebar.slider(
         "Seasons to base projections on",
-        LAST_COMPLETE_SEASON - 5, LAST_COMPLETE_SEASON,
-        (LAST_COMPLETE_SEASON - 2, LAST_COMPLETE_SEASON),
+        newest_season - 5, newest_season,
+        (newest_season - 2, newest_season),
     )
-    projected_games = st.sidebar.slider("Projected games next season", 10, 17, 16)
+    default_games = min(SEASON["weeks_remaining"], 17) if in_season else 16
+    projected_games = st.sidebar.slider(
+        "Games remaining to project" if in_season else "Projected games next season",
+        1 if in_season else 10, 17, default_games,
+        help="In-season this defaults to the weeks left on the schedule, so season totals "
+             "become rest-of-season totals." if in_season else None,
+    )
     min_games = st.sidebar.slider("Minimum games played (sample size)", 1, 20, 6)
     td_reg = st.sidebar.slider(
         "TD regression", 0.0, 0.6, 0.3, 0.05,
@@ -129,8 +151,12 @@ if source == "nflverse (live)":
     try:
         with st.spinner(f"Downloading {seasons[0]}–{seasons[-1]} stats from nflverse…"):
             weekly = ds.load_nflverse_weekly(tuple(seasons))
+        # A requested season may not be published yet — keep only what came back
+        seasons = sorted(int(x) for x in weekly["season"].unique()) or seasons
         season_stats = ds.aggregate_seasons(weekly)
-        df = pj.build_projections(season_stats, seasons, projected_games, min_games, td_reg)
+        active_seasons = seasons[-2:] if in_season else [max(seasons)]
+        df = pj.build_projections(season_stats, seasons, projected_games, min_games, td_reg,
+                                  active_seasons=active_seasons)
     except Exception as e:
         st.error(f"Could not download nflverse data ({e}). Check your connection or switch to sample data.")
         st.stop()
@@ -159,8 +185,13 @@ if source == "nflverse (live)":
             sources_down.append("nflverse injury history")
 
     # Defense ratings — shared by strength of schedule and the weekly model
+    ratings_blend = 0.0
     if {"Strength of schedule", "Week-by-week schedule & weather"} & set(enrich):
-        ratings = ds.defense_ratings(weekly, max(seasons), score)
+        if in_season and CURRENT_SEASON in seasons and len(seasons) > 1:
+            ratings, ratings_blend = ds.blended_defense_ratings(
+                weekly, sorted(seasons)[-2], CURRENT_SEASON, score, SEASON["weeks_played"])
+        else:
+            ratings = ds.defense_ratings(weekly, max(seasons), score)
 
     # Strength of schedule
     if "Strength of schedule" in enrich:
@@ -197,6 +228,13 @@ if source == "nflverse (live)":
                 sources_ok.append(f"Open-Meteo forecast ({len(game_weather)} games)")
         else:
             sources_down.append(f"{UPCOMING_SEASON} week-by-week schedule")
+
+    if in_season:
+        sources_ok.append(
+            f"in-season mode (week {SEASON['current_week']}, "
+            f"{SEASON['weeks_remaining']} weeks left"
+            + (f", defenses {ratings_blend:.0%} current-year" if ratings_blend else "") + ")"
+        )
 
     msg = f"Loaded: {', '.join(sources_ok)}."
     if sources_down:
@@ -286,6 +324,9 @@ with tab_rank:
                      "player fall past where your numbers rank them."),
         },
     )
+    if in_season:
+        st.caption(f"In-season: these are rest-of-season totals over {projected_games} remaining "
+                   "games. The Weekly tab breaks them out week by week with byes and matchups.")
     st.caption(
         "Replacement levels — " + " · ".join(
             f"{p}: {repl[p]:.0f} pts (≈{starters[p]:.0f} starters)" for p in POSITIONS)
@@ -325,6 +366,11 @@ with tab_mock:
     mode = c6.radio("Mode", ["Simulate the whole draft", "Draft interactively"], horizontal=True,
                     key="md_mode")
     seed = c7.number_input("Seed", 0, 9999, 7, key="md_seed", help="Same seed = same draft. Change it for a new room.")
+
+    if in_season:
+        st.info(f"The season is underway (week {SEASON['current_week']}), so ADP and this "
+                "simulator describe a draft board rather than your league. Still useful for "
+                "dynasty startups and late-drafting leagues.")
 
     cfg = md.DraftConfig(
         teams=int(teams), rounds=int(rounds), my_slot=int(my_slot), adp_weight=float(adp_weight),
@@ -519,9 +565,20 @@ with tab_week:
             pass_rate_outlook=outlook, top_n=300,
         )
 
-        all_weeks = sorted(weekly_df["week"].unique())
+        all_weeks = sorted(int(w) for w in weekly_df["week"].unique())
+        weeks_left = [w for w in all_weeks if w >= SEASON["current_week"]] if in_season else all_weeks
+
+        r1, r2 = st.columns([1, 3])
+        only_left = r1.checkbox("Only weeks I have left", value=in_season, disabled=not in_season,
+                                key="wk_remaining")
+        weeks_shown = weeks_left if (only_left and in_season) else all_weeks
+        if in_season:
+            r2.caption(f"Week {SEASON['current_week']} of {SEASON['total_weeks']} — "
+                       f"{SEASON['weeks_remaining']} to play. Projections blend "
+                       f"{CURRENT_SEASON} games in as they happen.")
+
         w1, w2, w3 = st.columns([1, 2, 3])
-        week_pick = w1.selectbox("Week", all_weeks, key="wk_week")
+        week_pick = w1.selectbox("Week", weeks_shown, key="wk_week")
         pos_pick = w2.multiselect("Positions", POSITIONS, default=POSITIONS, key="wk_positions")
         roster = w3.multiselect("Only my players (optional)", df["player"].tolist(), key="wk_roster")
 
@@ -553,7 +610,8 @@ with tab_week:
         st.divider()
         d1, d2 = st.columns([2, 3])
         focus = d1.selectbox("Player detail", weekly_df["player"].drop_duplicates().tolist(), key="wk_focus")
-        focus_week = d2.select_slider("Break down which week?", all_weeks, value=week_pick, key="wk_bdweek")
+        focus_week = d2.select_slider("Break down which week?", weeks_shown, value=week_pick,
+                                      key="wk_bdweek")
 
         pdata = weekly_df[weekly_df["player"] == focus].sort_values("week")
         fig = go.Figure()
@@ -581,17 +639,37 @@ with tab_week:
             b2.plotly_chart(fig2, width="stretch")
 
         st.divider()
+        ros_label = "Rest of season" if in_season else "Full season"
+        st.markdown(f"**{ros_label} totals** — every weekly adjustment added up over "
+                    f"weeks {min(weeks_shown)}–{max(weeks_shown)}.")
+        ros = wk.stretch_summary(weekly_df, weeks_shown, min_rank=int(teams) * 15)
+        ros_pos = st.multiselect("Positions", POSITIONS, default=POSITIONS, key="ros_positions")
+        st.dataframe(
+            ros[ros["position"].isin(ros_pos)].head(120).rename(
+                columns={"player": "Player", "position": "Pos", "team": "Team",
+                         "stretch_total": f"{ros_label} Pts", "stretch_ppg": "PPG",
+                         "season_ppg": "Baseline PPG", "edge": "Edge", "games": "Games",
+                         "byes": "Byes"}),
+            width="stretch", hide_index=True, height=420,
+        )
+        st.caption("“Edge” is how much the schedule, injuries and weather move a player off their "
+                   "baseline per-game average. This is the in-season equivalent of the Rankings "
+                   "tab — it already knows about byes and matchups.")
+
+        st.divider()
         st.markdown("**Fantasy playoff stretch** — who gets easier weeks when it matters.")
         p1, p2 = st.columns([2, 3])
-        playoff_weeks = p1.multiselect("Playoff weeks", all_weeks, key="wk_playoff",
-                                       default=[w for w in all_weeks if w >= max(all_weeks) - 3])
+        playoff_default = [w for w in weeks_shown if w >= max(weeks_shown) - 3]
+        playoff_weeks = p1.multiselect("Playoff weeks", weeks_shown, key="wk_playoff",
+                                       default=playoff_default)
         if playoff_weeks:
             stretch = wk.stretch_summary(weekly_df, playoff_weeks, min_rank=int(teams) * 12)
             p2.dataframe(
-                stretch.head(20).rename(columns={"player": "Player", "position": "Pos",
-                                                 "team": "Team", "stretch_ppg": "Stretch PPG",
-                                                 "season_ppg": "Season PPG", "edge": "Edge",
-                                                 "byes": "Byes"}),
+                stretch.head(20)[["player", "position", "team", "stretch_ppg", "season_ppg",
+                                  "edge", "byes"]]
+                .rename(columns={"player": "Player", "position": "Pos", "team": "Team",
+                                 "stretch_ppg": "Stretch PPG", "season_ppg": "Season PPG",
+                                 "edge": "Edge", "byes": "Byes"}),
                 width="stretch", hide_index=True, height=400,
             )
 

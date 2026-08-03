@@ -41,11 +41,25 @@ def name_key(s: pd.Series) -> pd.Series:
 # ----------------------------------------------------------------------------
 # nflverse: weekly stats → player-season aggregates (keeps opponent for defense ratings)
 # ----------------------------------------------------------------------------
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def load_nflverse_weekly(seasons: tuple[int, ...]) -> pd.DataFrame:
+def _load_player_stats(seasons: list[int]):
+    """nflverse publishes a season's stats file only once week 1 has been played,
+    so asking for it early raises. Drop the newest season and retry."""
     import nflreadpy as nfl
 
-    weekly = nfl.load_player_stats(list(seasons)).to_pandas()
+    remaining = sorted(seasons)
+    while remaining:
+        try:
+            return nfl.load_player_stats(remaining).to_pandas()
+        except Exception:
+            if len(remaining) == 1:
+                raise
+            remaining = remaining[:-1]
+    raise RuntimeError("No seasons available")
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def load_nflverse_weekly(seasons: tuple[int, ...]) -> pd.DataFrame:
+    weekly = _load_player_stats(list(seasons))
     if "season_type" in weekly.columns:
         weekly = weekly[weekly["season_type"] == "REG"]
 
@@ -429,3 +443,70 @@ def load_game_weather(games: pd.DataFrame) -> pd.DataFrame | None:
             "precip_pct": at("precipitation_probability"),
         })
     return pd.DataFrame(rows) if rows else None
+
+
+# ----------------------------------------------------------------------------
+# Where are we in the season? Drives in-season mode.
+# ----------------------------------------------------------------------------
+@st.cache_data(ttl=60 * 60 * 3, show_spinner=False)
+def season_state(season: int, now: pd.Timestamp | None = None) -> dict:
+    """Has this season started, which week is live, how much is left.
+
+    A week counts as played once its last kickoff is ~4 hours old (games run about
+    3¼ hours). Kickoff times are Eastern and compared against local clock time, so
+    the changeover can be off by a few hours in other timezones.
+    """
+    blank = {"available": False, "started": False, "complete": False,
+             "current_week": 1, "weeks_played": 0, "weeks_remaining": 17,
+             "total_weeks": 17, "remaining_weeks": list(range(1, 18))}
+    try:
+        games = load_schedule_games(season)
+    except Exception:
+        return blank
+    if games is None or games.empty or games["kickoff"].isna().all():
+        return blank
+
+    now = pd.Timestamp.now() if now is None else pd.Timestamp(now)
+    weeks = sorted(int(w) for w in games["week"].unique())
+    last_kick = games.groupby("week")["kickoff"].max()
+    played = [w for w in weeks if pd.notna(last_kick.get(w))
+              and last_kick[w] + pd.Timedelta(hours=4) < now]
+    remaining = [w for w in weeks if w not in played]
+
+    return {
+        "available": True,
+        "started": bool(games["kickoff"].min() < now),
+        "complete": not remaining,
+        "current_week": remaining[0] if remaining else weeks[-1],
+        "weeks_played": len(played),
+        "weeks_remaining": len(remaining),
+        "total_weeks": len(weeks),
+        "remaining_weeks": remaining or [weeks[-1]],
+    }
+
+
+def blended_defense_ratings(weekly: pd.DataFrame, prior_season: int, current_season: int,
+                            score_fn, weeks_played: int, shrink: float = 6.0):
+    """In-season, blend this year's defenses with last year's.
+
+    Six games of data is noisy, so the current season's weight grows as
+    weeks_played / (weeks_played + shrink) — 50% at 6 weeks, ~74% at 17.
+    """
+    prior = defense_ratings(weekly, prior_season, score_fn)
+    current = defense_ratings(weekly, current_season, score_fn)
+    if current is None or current.empty:
+        return prior, 0.0
+    if prior is None or prior.empty:
+        return current, 1.0
+
+    w = float(weeks_played) / (float(weeks_played) + shrink)
+    merged = prior.merge(current, on=["def_team", "position"], how="outer",
+                         suffixes=("_prior", "_cur"))
+    blend = (
+        w * merged["fpts_allowed_pg_cur"].fillna(merged["fpts_allowed_pg_prior"])
+        + (1 - w) * merged["fpts_allowed_pg_prior"].fillna(merged["fpts_allowed_pg_cur"])
+    )
+    out = merged[["def_team", "position"]].copy()
+    out["fpts_allowed_pg"] = blend
+    out["def_pctl"] = out.groupby("position")["fpts_allowed_pg"].rank(pct=True) * 100
+    return out, w

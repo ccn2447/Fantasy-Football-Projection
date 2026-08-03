@@ -260,14 +260,18 @@ def stretch_summary(weekly_df: pd.DataFrame, weeks: list[int], min_rank: int = 2
     sub = weekly_df[(weekly_df["week"].isin(weeks)) & (weekly_df["overall_rank"] <= min_rank)]
     out = (
         sub.groupby(["player", "position", "team"])
-        .agg(stretch_ppg=("proj_pts_week", "mean"),
+        .agg(stretch_total=("proj_pts_week", "sum"),
+             stretch_ppg=("proj_pts_week", "mean"),
              season_ppg=("ppg", "first"),
+             games=("is_bye", lambda b: int((~b.astype(bool)).sum())),
              byes=("is_bye", "sum"))
         .reset_index()
     )
+    # Average over games actually played, not over weeks including byes
+    out["stretch_ppg"] = (out["stretch_total"] / out["games"].replace(0, np.nan)).round(2)
+    out["stretch_total"] = out["stretch_total"].round(1)
     out["edge"] = (out["stretch_ppg"] - out["season_ppg"]).round(2)
-    out["stretch_ppg"] = out["stretch_ppg"].round(2)
-    return out.sort_values("stretch_ppg", ascending=False)
+    return out.sort_values("stretch_total", ascending=False)
 
 
 def factor_breakdown(weekly_df: pd.DataFrame, player: str, week: int) -> pd.DataFrame:
