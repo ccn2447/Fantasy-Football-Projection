@@ -104,7 +104,10 @@ def build_pool(df: pd.DataFrame, cfg: DraftConfig, pad: int = 80) -> pd.DataFram
     pool = pool.reset_index(drop=True)
 
     proj_rank = pool["proj_pts"].rank(ascending=False, method="first")
-    vor_rank = pool["vor"].rank(ascending=False, method="first")
+    # overall_rank already carries any expert blending; fall back to raw VOR
+    vor_rank = (pool["overall_rank"].rank(method="first")
+                if "overall_rank" in pool.columns
+                else pool["vor"].rank(ascending=False, method="first"))
     # Undrafted-by-the-market players sit a couple of rounds behind their projection rank
     market_rank = pool["adp"].rank(method="first")
     market_rank = market_rank.fillna(vor_rank + cfg.teams * 2)

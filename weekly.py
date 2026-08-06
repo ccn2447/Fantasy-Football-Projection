@@ -122,7 +122,8 @@ def build_weekly(
     top_n: int = 300,
 ) -> pd.DataFrame:
     """One row per player per week (byes included, with 0 points)."""
-    cols = ["player", "player_id", "team", "position", "proj_pts", "ppg", "overall_rank"]
+    cols = ["player", "player_id", "team", "position", "proj_pts", "ppg", "overall_rank",
+            "name_key_"]   # name_key_ lets the expert weekly file join on
     cols = [c for c in cols if c in df.columns]
     base = df.nsmallest(min(top_n, len(df)), "overall_rank")[cols].copy()
     base = pd.concat([base, component_shares(df.loc[base.index], scoring)], axis=1)

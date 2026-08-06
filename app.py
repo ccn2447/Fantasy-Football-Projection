@@ -19,8 +19,10 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import data_sources as ds
+import experts as ex
 import mock_draft as md
 import projections as pj
+import rookies as rk
 import weekly as wk
 from data_sources import POSITIONS
 
@@ -81,12 +83,36 @@ if source == "nflverse (live)":
     enrich = st.sidebar.multiselect(
         "Extra data (each adds a download)",
         ["Injury status & history", "Strength of schedule", "Market ADP",
-         "Week-by-week schedule & weather"],
+         "Week-by-week schedule & weather", "Rookie projections",
+         "Expert consensus (FantasyPros)"],
         default=["Injury status & history", "Strength of schedule", "Market ADP",
-                 "Week-by-week schedule & weather"],
+                 "Week-by-week schedule & weather", "Rookie projections",
+                 "Expert consensus (FantasyPros)"],
     )
+    expert_weight = st.sidebar.slider(
+        "Trust experts", 0.0, 1.0, 0.3, 0.05,
+        help="How much expert consensus (FantasyPros ECR) moves the board order. Your own "
+             "projection rank is always kept in its own column. Rookies lean on the experts "
+             "regardless — a draft-capital prior is an average, the experts watched the player. "
+             "Keep this low if you want the board to stay yours: consensus and ADP are nearly "
+             "the same signal, so a high setting makes “value vs ADP” compare the market to itself.",
+    )
+    rookie_weight = st.sidebar.slider(
+        "Rookie market weight", 0.0, 1.0, 0.5, 0.1,
+        help="Draft capital says what a pick is worth on average; ADP says what this "
+             "rookie actually walked into. 0 = draft capital only, 1 = follow the market.",
+    )
+    if in_season:
+        inseason_k = st.sidebar.slider(
+            "Games before this season takes over", 1, 10, 4,
+            help="A player's rankings are half their preseason projection and half this "
+                 "season's production after this many games. Lower = react faster.",
+        )
+    else:
+        inseason_k = 4
 else:
     enrich = []
+    rookie_weight, inseason_k, expert_weight = 0.5, 4, 0.0
 
 teams = st.sidebar.number_input("Teams in league", 4, 20, 12)
 
@@ -127,6 +153,10 @@ SCORING = dict(
 )
 
 
+def has_adp_col(d: pd.DataFrame) -> bool:
+    return "adp" in d.columns and d["adp"].notna().any()
+
+
 def score(d: pd.DataFrame) -> pd.Series:
     rec_pts = d["receptions"] * pts_per_rec
     if te_bonus > 0 and "position" in d.columns:
@@ -145,7 +175,8 @@ def score(d: pd.DataFrame) -> pd.Series:
 # ----------------------------------------------------------------------------
 st.title("Fantasy Football Projection Tool")
 
-tendencies = sos = ratings = games = game_weather = None
+tendencies = sos = ratings = games = game_weather = rookie_curve = None
+train = ()
 if source == "nflverse (live)":
     seasons = list(range(season_range[0], season_range[1] + 1))
     try:
@@ -154,14 +185,41 @@ if source == "nflverse (live)":
         # A requested season may not be published yet — keep only what came back
         seasons = sorted(int(x) for x in weekly["season"].unique()) or seasons
         season_stats = ds.aggregate_seasons(weekly)
-        active_seasons = seasons[-2:] if in_season else [max(seasons)]
-        df = pj.build_projections(season_stats, seasons, projected_games, min_games, td_reg,
+        # In-season, the baseline stays the *preseason* board — prior seasons only.
+        # This year enters once, through the weekly update below, instead of twice.
+        hist_seasons = [s for s in seasons if s != CURRENT_SEASON] or seasons
+        active_seasons = hist_seasons[-2:] if in_season else [max(hist_seasons)]
+        df = pj.build_projections(season_stats, hist_seasons, projected_games, min_games, td_reg,
                                   active_seasons=active_seasons)
+        df["is_rookie"] = False
     except Exception as e:
         st.error(f"Could not download nflverse data ({e}). Check your connection or switch to sample data.")
         st.stop()
 
     sources_ok, sources_down = [f"nflverse {seasons[0]}–{seasons[-1]}"], []
+
+    # Rookies — no NFL stats, so they get a draft-capital prior instead
+    rookie_curve = None
+    if "Rookie projections" in enrich:
+        with st.spinner("Fitting the rookie curve on past draft classes…"):
+            train = tuple(range(LAST_COMPLETE_SEASON - 6, LAST_COMPLETE_SEASON + 1))
+            try:
+                train_weekly = ds.load_nflverse_weekly(train)
+                rookie_curve = rk.fit_rookie_curve(train_weekly, train)
+                # Anyone with stats before this season is by definition not a rookie
+                veterans = set(train_weekly.loc[train_weekly["season"] < CURRENT_SEASON, "player_id"])
+                veterans |= set(weekly.loc[weekly["season"] < CURRENT_SEASON, "player_id"])
+                rook = rk.project_rookies(
+                    rookie_curve, CURRENT_SEASON, projected_games,
+                    exclude_ids=veterans, rosters=rk.load_roster_rookies(CURRENT_SEASON),
+                )
+            except Exception:
+                rookie_curve, rook = None, None
+        if rook is not None and len(rook):
+            df = pd.concat([df, rook], ignore_index=True)
+            sources_ok.append(f"{len(rook)} rookies (draft capital {min(train)}–{max(train)})")
+        else:
+            sources_down.append("rookie projections")
 
     # Team tendencies (pass/run) — free, computed from already-downloaded data
     tendencies = ds.team_tendencies(weekly, max(seasons))
@@ -229,6 +287,31 @@ if source == "nflverse (live)":
         else:
             sources_down.append(f"{UPCOMING_SEASON} week-by-week schedule")
 
+    # Expert consensus — a separate input, never the backbone
+    if "Expert consensus (FantasyPros)" in enrich:
+        with st.spinner("Fetching expert consensus rankings…"):
+            ecr = ex.load_draft_ecr(superflex=superflex_slots > 0)
+        if ecr is not None:
+            df = ex.attach(df, ecr)
+            scraped = str(df["ecr_scrape"].dropna().iloc[0])[:10] if df["ecr_scrape"].notna().any() else "?"
+            sources_ok.append(f"FantasyPros ECR ({scraped})")
+        else:
+            sources_down.append("FantasyPros expert consensus")
+
+    # Rookies inside the same draft range are separated by what the market saw
+    if df.get("is_rookie") is not None and df["is_rookie"].fillna(False).any() and has_adp_col(df):
+        df = rk.adjust_with_adp(df, score, weight=rookie_weight)
+
+    # The preseason board becomes a prior that this season updates every week
+    if in_season and CURRENT_SEASON in seasons:
+        pre = score(df)
+        df["preseason_pts"] = pre.round(1)
+        df["preseason_rank"] = pre.rank(ascending=False, method="first").astype(int)
+        df = pj.in_season_update(df, weekly[weekly["season"] == CURRENT_SEASON],
+                                 projected_games, k=float(inseason_k))
+        df["is_rookie"] = df["is_rookie"].fillna(False)
+        sources_ok.append(f"weekly update through week {SEASON['weeks_played']}")
+
     if in_season:
         sources_ok.append(
             f"in-season mode (week {SEASON['current_week']}, "
@@ -264,10 +347,28 @@ starters, repl = pj.replacement_levels(
     df, teams, qb_slots, rb_slots, wr_slots, te_slots, flex_slots, superflex_slots
 )
 df["vor"] = (df["proj_pts"] - df["position"].map(repl)).round(1)
-df = df.sort_values("vor", ascending=False).reset_index(drop=True)
+df["model_rank"] = df["vor"].rank(ascending=False, method="first").astype(int)
+
+has_ecr = "ecr" in df.columns and df["ecr"].notna().any()
+if has_ecr:
+    df["ecr_pctl"] = ex.uncertainty(df)
+    df["ecr_spread"] = ex.spread_label(df["ecr_pctl"])
+
+if has_ecr and expert_weight > 0:
+    df = ex.blend_board(df, expert_weight)
+    df = df.sort_values(["blend_score", "vor"], ascending=[True, False]).reset_index(drop=True)
+else:
+    df = df.sort_values("vor", ascending=False).reset_index(drop=True)
 df["overall_rank"] = df.index + 1
 df["pos_rank"] = df.groupby("position")["proj_pts"].rank(ascending=False, method="first").astype(int)
 df["tier"] = df.groupby("position", group_keys=False).apply(pj.assign_tiers).astype(int)
+
+has_rookies = "is_rookie" in df.columns and df["is_rookie"].fillna(False).any()
+is_live_board = "update_weight" in df.columns
+if has_rookies:
+    df["rookie"] = np.where(df["is_rookie"].fillna(False), "R", "")
+if is_live_board and "preseason_rank" in df.columns:
+    df["rank_delta"] = (df["preseason_rank"] - df["overall_rank"]).round(0)
 
 has_adp = "adp" in df.columns and df["adp"].notna().any()
 has_injury = "injury" in df.columns
@@ -280,9 +381,9 @@ if has_adp:
 # ----------------------------------------------------------------------------
 # Tabs
 # ----------------------------------------------------------------------------
-(tab_rank, tab_strategy, tab_mock, tab_week, tab_news, tab_compare,
+(tab_rank, tab_strategy, tab_mock, tab_week, tab_experts, tab_news, tab_compare,
  tab_pos, tab_teams, tab_cheat) = st.tabs([
-    "📋 Rankings", "🎯 Draft Strategy", "🕹️ Mock Draft", "📅 Weekly",
+    "📋 Rankings", "🎯 Draft Strategy", "🕹️ Mock Draft", "📅 Weekly", "🤝 vs Experts",
     "🏥 News & Injuries", "⚖️ Compare", "📊 Positions", "🏟️ Teams", "📥 Cheat Sheet",
 ])
 
@@ -291,21 +392,43 @@ RENAME = {
     "pos_rank": "Pos Rank", "tier": "Tier", "proj_pts": "Proj Pts", "ppg": "PPG",
     "vor": "VOR", "adp": "ADP", "adp_value": "Value vs ADP", "injury": "Injury",
     "sos_pctl": "SOS", "pass_rate": "Team Pass %", "weeks_out": "Wks Out (LY)",
+    "rookie": "R", "games_played": "GP", "update_weight": "Live %",
+    "ecr": "ECR", "ecr_spread": "Expert spread", "ecr_delta": "ECR move",
+    "model_rank": "My Rank", "expert_rank": "Expert Rank", "gap": "Gap",
+    "rank_delta": "Δ vs preseason", "draft_pick": "Draft Pick",
 }
 
 # --- Rankings ---
 with tab_rank:
-    c1, c2, c3 = st.columns([2, 2, 3])
+    if is_live_board:
+        st.markdown(f"**Live board — {CURRENT_SEASON} week {SEASON['current_week']}.** Each player "
+                    "is part preseason projection, part what they have actually done this year; "
+                    "“Live %” is how much of the number is this season. It re-weights every week "
+                    "on its own.")
+    c1, c2, c3, c4 = st.columns([2, 2, 3, 1.4])
     pos_filter = c1.multiselect("Positions", POSITIONS, default=POSITIONS)
     top_n = c2.slider("Show top N", 10, max(len(df), 10), min(150, len(df)))
     search = c3.text_input("Search player")
+    rookies_only = c4.checkbox("Rookies only", value=False, disabled=not has_rookies)
 
     view = df[df["position"].isin(pos_filter)]
     if search:
         view = view[view["player"].str.contains(search, case=False, na=False)]
+    if rookies_only and has_rookies:
+        view = view[view["is_rookie"].fillna(False)]
     view = view.head(top_n)
 
     cols = ["overall_rank", "player", "team", "position", "pos_rank", "tier", "proj_pts", "ppg", "vor"]
+    if has_rookies:
+        cols.insert(2, "rookie")
+    if has_ecr:
+        cols += ["ecr", "ecr_spread"]
+        if expert_weight > 0:
+            cols.insert(1, "model_rank")
+    if is_live_board:
+        cols += ["games_played", "update_weight"]
+        if "rank_delta" in df.columns:
+            cols += ["rank_delta"]
     if has_adp:
         cols += ["adp", "adp_value"]
     if has_injury:
@@ -322,8 +445,37 @@ with tab_rank:
             "Value vs ADP": st.column_config.NumberColumn(
                 help="Market ADP minus your projection rank. Positive = the market lets this "
                      "player fall past where your numbers rank them."),
+            "ECR": st.column_config.NumberColumn(
+                format="%.1f",
+                help="FantasyPros expert consensus rank. Lower is better."),
+            "Expert spread": st.column_config.TextColumn(
+                help="How much the experts disagree, compared with players ranked near them. "
+                     "“Wide open” means a genuinely contested player."),
+            "My Rank": st.column_config.NumberColumn(
+                help="Your projections' own rank, before any expert blending."),
+            "R": st.column_config.TextColumn(
+                help="Rookie — projected from draft capital and market ADP, not NFL stats."),
+            "Live %": st.column_config.NumberColumn(
+                format="%.2f",
+                help="Share of this projection coming from this season's games rather than "
+                     "the preseason baseline."),
+            "Δ vs preseason": st.column_config.NumberColumn(
+                help="Places gained since the preseason board. Positive = rising."),
         },
     )
+
+    if has_rookies and rookie_curve is not None:
+        with st.expander("How rookies are projected"):
+            st.markdown(
+                "Rookies have no NFL stats, so they get a prior built from draft capital. For every "
+                f"rookie class in {min(train)}–{max(train)}, this totals what the class actually "
+                "produced and divides by the games it could have played — so the ~15% of drafted "
+                "rookies who never record a stat are already priced in. Market ADP then separates "
+                "rookies taken in the same range, because ADP knows the depth chart they landed in."
+            )
+            st.dataframe(rk.curve_table(rookie_curve, score), width="stretch", hide_index=True)
+            st.caption("Expected per-game points under *your* scoring settings. Treat these as the "
+                       "average outcome for a pick in that range, not a prediction for any one player.")
     if in_season:
         st.caption(f"In-season: these are rest-of-season totals over {projected_games} remaining "
                    "games. The Weekly tab breaks them out week by week with byes and matchups.")
@@ -604,6 +756,39 @@ with tab_week:
                     help="Volume freed up by injured teammates at the same position."),
             },
         )
+        if "Expert consensus (FantasyPros)" in enrich:
+            wecr = ex.load_weekly_ecr()
+            if wecr is not None and wecr["week_scrape"].notna().any():
+                scrape = pd.to_datetime(wecr["week_scrape"].dropna().iloc[0], errors="coerce")
+                fresh = pd.notna(scrape) and (pd.Timestamp.now() - scrape).days <= 14
+                with st.expander(
+                        f"Compare with expert weekly rankings (snapshot {str(scrape)[:10]})",
+                        expanded=bool(fresh)):
+                    if not fresh:
+                        st.warning("This snapshot is stale — FantasyPros' weekly file only "
+                                   "refreshes during the season, so it still holds last "
+                                   "season's final week. It will be live again once games start.")
+                    cmp_df = wv.merge(wecr, on=["name_key_", "position"], how="inner") \
+                        if "name_key_" in wv.columns else pd.DataFrame()
+                    if len(cmp_df):
+                        cmp_df["diff"] = (cmp_df["proj_pts_week"] - cmp_df["expert_pts"]).round(2)
+                        CC = {"player": "Player", "position": "Pos", "team": "Team",
+                              "opponent": "Opp", "proj_pts_week": "My Pts",
+                              "expert_pts": "Expert Pts", "diff": "Δ",
+                              "week_pos_rank": "Expert Pos Rank", "start_sit": "Grade"}
+                        st.dataframe(
+                            cmp_df.reindex(cmp_df["diff"].abs().sort_values(ascending=False).index)
+                            [[c for c in CC if c in cmp_df.columns]].rename(columns=CC).head(40),
+                            width="stretch", hide_index=True, height=420)
+                        st.caption(
+                            "Sorted by disagreement. The expert number is FantasyPros' own weekly "
+                            "projection, not a rank conversion — where it differs sharply from "
+                            "yours, one of you is wrong about the matchup. It assumes standard PPR "
+                            "though, so if your league isn't PPR compare the *shape* of the "
+                            "disagreement rather than the raw gap.")
+                    else:
+                        st.caption("No overlapping players between the two sets this week.")
+
         bye_teams = sorted(weekly_df.loc[(weekly_df["week"] == week_pick) & weekly_df["is_bye"], "team"].unique())
         st.caption(f"Week {week_pick} byes: " + (", ".join(bye_teams) if bye_teams else "none"))
 
@@ -683,6 +868,84 @@ with tab_week:
             "Weather only adjusts games inside the forecast window and outdoors; everything else "
             "shows as “No forecast yet”. Matchup ratings come from last season's defenses, so treat "
             "week 14 as a rough sketch, not a lineup decision."
+        )
+
+# --- vs Experts ---
+with tab_experts:
+    if not has_ecr:
+        st.info("Enable **Expert consensus (FantasyPros)** in the sidebar to load this tab.")
+    else:
+        scraped = str(df["ecr_scrape"].dropna().iloc[0])[:10] if df["ecr_scrape"].notna().any() else "unknown"
+        matched = int(df["ecr"].notna().sum())
+        st.markdown(
+            f"Expert consensus from FantasyPros, scraped **{scraped}** ({matched} players matched). "
+            "The point of carrying both isn't to average them into one number — it's to produce a "
+            "short list of players worth actually looking into."
+        )
+
+        st.subheader("Where you disagree")
+        g1, g2 = st.columns([1, 3])
+        min_gap = g1.slider("Minimum gap (places)", 5, 60, 15, 5, key="ex_gap")
+        higher, lower = ex.disagreements(df, min_gap=int(min_gap), top_n=15,
+                                         max_rank=int(teams) * 15)
+        DCOLS = {"player": "Player", "position": "Pos", "team": "Team", "model_rank": "My Rank",
+                 "expert_rank": "Expert Rank", "gap": "Gap", "proj_pts": "Proj Pts",
+                 "ecr_sd": "Expert SD"}
+        d1, d2 = st.columns(2)
+        d1.markdown("**Your model is higher** — your numbers like them, the room doesn't. "
+                    "Late-round value if you're right, a trap if the experts know something "
+                    "about their role that last season's stats don't.")
+        d1.dataframe(higher[[c for c in DCOLS if c in higher.columns]].rename(columns=DCOLS)
+                     if len(higher) else pd.DataFrame({"": ["No gaps this large"]}),
+                     width="stretch", hide_index=True, height=420)
+        d2.markdown("**Consensus is higher** — the experts see something your stats can't: a "
+                    "changed role, an offseason move, a second-year leap. Worth a look before "
+                    "you let them fall past you.")
+        d2.dataframe(lower[[c for c in DCOLS if c in lower.columns]].rename(columns=DCOLS)
+                     if len(lower) else pd.DataFrame({"": ["No gaps this large"]}),
+                     width="stretch", hide_index=True, height=420)
+
+        st.divider()
+        st.subheader("How certain are the experts?")
+        st.markdown("Each player's spread of expert opinions, measured against players ranked "
+                    "near them. A wide spread near the top of the board is a real argument, not "
+                    "noise — those are the picks where your own read matters most.")
+        UCOLS = {"player": "Player", "position": "Pos", "team": "Team", "ecr": "ECR",
+                 "ecr_best": "Best", "ecr_worst": "Worst", "ecr_sd": "SD",
+                 "ecr_spread": "Verdict", "overall_rank": "Rank"}
+        pool_ecr = df[df["ecr"].notna() & (df["overall_rank"] <= int(teams) * 15)]
+        u1, u2 = st.columns(2)
+        u1.markdown("**Most contested**")
+        u1.dataframe(pool_ecr.nlargest(12, "ecr_pctl")[[c for c in UCOLS if c in pool_ecr.columns]]
+                     .rename(columns=UCOLS).round(2), width="stretch", hide_index=True, height=440)
+        u2.markdown("**Most agreed-on**")
+        u2.dataframe(pool_ecr.nsmallest(12, "ecr_pctl")[[c for c in UCOLS if c in pool_ecr.columns]]
+                     .rename(columns=UCOLS).round(2), width="stretch", hide_index=True, height=440)
+
+        st.divider()
+        st.subheader("Consensus movement")
+        up, down = ex.movers(df, top_n=12, max_rank=int(teams) * 15)
+        MCOLS = {"player": "Player", "position": "Pos", "team": "Team", "ecr": "ECR",
+                 "ecr_delta": "Move", "overall_rank": "Your Rank"}
+        if len(up) or len(down):
+            m1, m2 = st.columns(2)
+            m1.markdown("**Rising** — consensus climbing, usually news the stats haven't caught")
+            m1.dataframe(up[[c for c in MCOLS if c in up.columns]].rename(columns=MCOLS),
+                         width="stretch", hide_index=True, height=380)
+            m2.markdown("**Falling** — the room is cooling on them")
+            m2.dataframe(down[[c for c in MCOLS if c in down.columns]].rename(columns=MCOLS),
+                         width="stretch", hide_index=True, height=380)
+        else:
+            st.info("The current snapshot has no rank movement for players in your draft range. "
+                    "FantasyPros only populates this field on some scrapes — it fills in during "
+                    "the season, when consensus actually moves week to week.")
+
+        st.caption(
+            "Why experts aren't driving the projections: consensus and ADP are close to the same "
+            "signal, since drafters read these rankings. Blend them in too heavily and the "
+            "value-vs-ADP column compares the market against itself, and none of it respects your "
+            "scoring settings. The “Trust experts” slider controls how far the board moves; your "
+            "own rank stays visible either way."
         )
 
 # --- News & Injuries ---
