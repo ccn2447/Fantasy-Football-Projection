@@ -207,6 +207,23 @@ def generate_strategy(
                              f"your rank {int(r['overall_rank'])}")
         lines.append("")
 
+    # Rookies
+    if "is_rookie" in df.columns and df["is_rookie"].fillna(False).any():
+        rooks = df[df["is_rookie"].fillna(False) & (df["overall_rank"] <= teams * 12)]
+        if len(rooks):
+            top = rooks.nsmallest(6, "overall_rank")
+            lines.append("**Rookies in your draft range.** These come from draft capital and market "
+                         "ADP rather than NFL stats, so treat them as a range, not a number — the "
+                         "spread of outcomes is far wider than for a veteran with three years of tape:")
+            for _, r in top.iterrows():
+                pick = f", pick {int(r['draft_pick'])}" if pd.notna(r.get("draft_pick")) else ""
+                lines.append(f"- {r['player']} ({r['position']}, {r['team']}{pick}) — "
+                             f"rank {int(r['overall_rank'])}, {r['proj_pts']:.0f} pts")
+            lines.append("Rookie running backs hit earliest; rookie tight ends almost never pay off "
+                         "in year one. If two players are close, the veteran is the safer floor and "
+                         "the rookie is the better upside swing.")
+            lines.append("")
+
     # Injury-discount targets
     if "injury_weeks" in df.columns:
         risky = df[(df["weeks_out"].fillna(0) >= 3) & (df["overall_rank"] <= teams * 8)]
@@ -220,3 +237,76 @@ def generate_strategy(
                  "VOR on the board when tiers are deep, and bank late-round picks on upside (ambiguous "
                  "backfields, year-2 receivers) rather than safe floors — replacement level is free on waivers.")
     return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------------
+# In-season: the preseason board becomes a prior that this season updates weekly
+# ----------------------------------------------------------------------------
+def in_season_update(
+    baseline: pd.DataFrame,
+    weekly_current: pd.DataFrame,
+    projected_games: int,
+    k: float = 4.0,
+    min_new_games: int = 2,
+) -> pd.DataFrame:
+    """Blend each player's preseason per-game rates with what they've actually done.
+
+    Weight on this season is games / (games + k) — half after `k` games. A rookie
+    whose whole projection was a draft-capital prior is running on real production
+    within a month; a veteran with four years of history moves more slowly.
+
+    Players who appear this season but aren't in the baseline (undrafted breakouts,
+    late signings) are added on their current production alone.
+    """
+    if weekly_current is None or weekly_current.empty:
+        return baseline
+
+    cur = (
+        weekly_current.sort_values(["season", "week"])
+        .groupby("player_id")
+        .agg(games_played=("week", "nunique"),
+             team_now=("team", "last"),
+             position_now=("position", "last"),
+             player_now=("player", "last"),
+             **{c: (c, "sum") for c in STAT_COLUMNS})
+        .reset_index()
+    )
+    cur = cur[cur["games_played"] > 0]
+    for col in STAT_COLUMNS:
+        cur[f"{col}_cur_pg"] = cur[col] / cur["games_played"]
+
+    df = baseline.merge(
+        cur[["player_id", "games_played", "team_now", "position_now", "player_now"]
+            + [f"{c}_cur_pg" for c in STAT_COLUMNS]],
+        on="player_id", how="outer", indicator=True,
+    )
+
+    is_new = df["_merge"] == "right_only"
+    df.loc[is_new, "player"] = df.loc[is_new, "player_now"]
+    df.loc[is_new, "position"] = df.loc[is_new, "position_now"]
+    df.loc[is_new, "seasons_used"] = 0
+    df.loc[is_new, "total_games"] = 0
+    df["is_new"] = is_new
+    df["team"] = df["team_now"].fillna(df["team"])
+
+    g = df["games_played"].fillna(0.0)
+    w = g / (g + float(k))
+    w = np.where(is_new, 1.0, w)                 # nothing to blend against
+    df["update_weight"] = np.round(w, 3)
+    df["games_played"] = g.astype(int)
+
+    for col in PROJ_STATS + ["pass_att", "carries", "targets"]:
+        base_pg = df.get(f"{col}_pg")
+        if base_pg is None:
+            continue
+        cur_pg = df[f"{col}_cur_pg"] if f"{col}_cur_pg" in df.columns else np.nan
+        cur_pg = pd.Series(cur_pg, index=df.index).fillna(base_pg)
+        blended = w * cur_pg + (1 - w) * base_pg.fillna(cur_pg)
+        df[f"{col}_pg"] = blended
+        df[col] = (blended * projected_games).round(1)
+
+    df["games"] = projected_games
+    df = df[~(is_new & (df["games_played"] < min_new_games))]   # ignore one-game blips
+    drop = [c for c in df.columns if c.endswith("_cur_pg")] + \
+           ["_merge", "team_now", "position_now", "player_now"]
+    return df.drop(columns=[c for c in drop if c in df.columns]).reset_index(drop=True)
